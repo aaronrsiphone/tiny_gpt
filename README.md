@@ -1,2 +1,257 @@
 # tiny_gpt
-Train tiny language models on your iOS device with python.
+
+Train tiny character-level language models from scratch — no PyTorch, no
+autograd, no pretrained weights — and run them on anything from a laptop to
+an iPhone in Pythonista.
+
+`tiny_gpt.py` is a full GPT (multi-head causal self-attention, real
+backprop) implemented directly over NumPy. On Apple hardware it routes every
+matmul through `cblas_sgemm` on the Accelerate framework's AMX coprocessor;
+everywhere else it falls back to plain NumPy and still runs correctly, just
+slower.
+
+![Training tiny_gpt on an iPhone in Pythonista](images/pythonista-ios.png)
+*Figure 1 — `tiny_gpt.py` training a model on-device in Pythonista on iOS.*
+
+This guide walks through the three things you'll actually do with this repo,
+in order:
+
+1. [Build a dataset](#1-build-a-dataset) with `direct_corpus.py`
+2. [Train a model](#2-train-a-model) with `tiny_gpt.py`
+3. [Chat with your model](#3-chat-with-your-model) with `chat.py`
+
+## Requirements
+
+- Python 3
+- `numpy`
+- Nothing else. On macOS/iOS, `tiny_gpt.py` automatically detects and uses
+  the system Accelerate framework for a large speedup; on every other
+  platform it silently falls back to NumPy matmuls and produces identical
+  results, just slower.
+
+## Repository layout
+
+| File               | Purpose                                              |
+|--------------------|-------------------------------------------------------|
+| `direct_corpus.py` | Downloads and assembles instruction/response datasets into a training corpus |
+| `tiny_gpt.py`      | The model: forward/backward pass, training loop, checkpointing |
+| `chat.py`          | Loads a trained checkpoint and generates, chats, or evaluates it |
+
+## 1. Build a dataset
+
+`direct_corpus.py` downloads public instruction-tuning datasets straight
+from their permanent file URLs (no Hugging Face API, no pagination, no rate
+limits) and folds them into a single plain-text corpus of `U: ... / A: ...`
+exchanges.
+
+List the available sources:
+
+```
+python direct_corpus.py list
+```
+
+```
+sources:
+
+  alpaca          52K GPT-generated instruction/output. CC BY-NC 4.0.
+  alpaca-cleaned  52K, community-corrected fork of alpaca. CC BY-NC 4.0.
+  dolly           15K human-written. CC BY-SA 3.0. Different register from alpaca.
+
+  all             = alpaca + dolly
+```
+
+Build a corpus from one or more sources:
+
+```
+python direct_corpus.py alpaca dolly --out big.txt
+```
+
+![direct_corpus.py downloading and assembling a training corpus](images/dataset-build.png)
+*Figure 2 — `direct_corpus.py` fetching sources, caching them on disk, and reporting corpus stats.*
+
+A few things worth knowing before you build one:
+
+- **Combining sources is the point.** A single dataset repeats too fast at
+  typical training lengths (a 5 MB corpus at 8192 tokens/step for 16,000
+  steps is ~26 epochs). Every extra source you mix in cuts the repetition
+  proportionally, so `all` is a reasonable default.
+- **Downloads are cached and resumable.** Each source is fetched once to a
+  local file; re-running the same command reuses the cache, and a
+  partial/interrupted download resumes with a `Range` request.
+- **Output is ASCII-folded** (smart quotes/dashes folded to plain ASCII,
+  everything outside printable ASCII + newline dropped) so the resulting
+  vocabulary is always printable ASCII plus `\n` — this keeps corpora
+  interchangeable for training and evaluation.
+- Useful flags: `--out FILE`, `--max-in N` / `--max-out N` (length filters
+  on the U/A turns), `--truncate` (truncate long turns instead of dropping
+  them), `--keep-unicode` (skip the ASCII fold), `--no-shuffle`.
+
+## 2. Train a model
+
+`tiny_gpt.py` trains a character-level GPT on the corpus you just built and
+periodically checkpoints the best validation loss to a `.npz` file.
+
+### Important: how this script takes its arguments
+
+Because `tiny_gpt.py` is designed to also run inside **Pythonista on iOS**,
+where there is no shell and no real `argv` to pass, the bottom of the file
+hardcodes its own argument list and **ignores whatever you type after
+`python tiny_gpt.py`**:
+
+```python
+if __name__ == '__main__':
+    sys.argv = [
+    'tiny_gpt.py',
+    'train',
+    'big.txt',
+    '--steps', '3600',
+    '--B', '32',
+    '--block-size', '256',
+    ...
+    ]
+```
+
+To configure your own training run, **edit this list directly** (corpus
+file, step count, model size, architecture flags, checkpoint name) rather
+than passing command-line flags — whatever you pass on the actual command
+line is discarded. This is the one thing that trips people up on a first
+read of the file.
+
+(The individual mode functions — `gradcheck`, `bench`, `profile` — do
+respect real `argv`, e.g. `python tiny_gpt.py gradcheck --rope 0`; it's only
+`train` that's pinned by the hardcoded block above.)
+
+### Architecture flags
+
+Six independently-switchable levers, all on by default in the hardcoded
+block above:
+
+| Flag                 | Effect                                                   |
+|-----------------------|----------------------------------------------------------|
+| `--rope 1`            | rotary position embeddings instead of a learned `wpe`    |
+| `--qk-norm 1`          | non-parametric RMSNorm on q/k, applied after RoPE         |
+| `--act relu2`          | squared ReLU instead of tanh-GELU                        |
+| `--zero-init 1`        | output projections and the head start at zero             |
+| `--value-residual 1`   | per-layer learnable shortcut back to layer-0 values       |
+| `--softcap 30`         | `c*tanh(logits/c)` before cross-entropy                   |
+
+Setting all six off exactly reproduces the original (pre-lever)
+architecture, and older checkpoints load that way automatically.
+
+### Running it
+
+Once the hardcoded block points at your corpus and settings:
+
+```
+python tiny_gpt.py
+```
+
+Training prints a step/loss/val table and checkpoints the best validation
+loss to the `--ckpt` path (default `model.npz`) every `--ckpt-every` steps,
+along with a short sample generation at the end of the run.
+
+![tiny_gpt.py training loop output](images/training-run.png)
+*Figure 3 — a training run in progress: step, learning rate, train loss, validation loss, and throughput.*
+
+Resuming a run continues the same cosine LR schedule instead of re-warming
+a converged model — set `resume` to a prior checkpoint path.
+
+Two extra modes are useful before committing to a long run:
+
+```
+python tiny_gpt.py gradcheck        # finite-difference check of every gradient
+python tiny_gpt.py bench            # throughput by phase (numpy vs. Accelerate)
+python tiny_gpt.py profile          # per-operation timing breakdown
+```
+
+#### Example training log (placeholder)
+
+<!-- TODO: replace with a real captured log from a full training run -->
+
+```
+step         lr      loss       val   ms/step   elapsed
+0      5.3e-06    4.2891    4.2814     412.3      0.4s
+250    1.3e-04    2.1043    2.0877     398.1    103.2s
+500    2.7e-04    1.7822    1.7691     395.6    206.8s
+750    3.9e-04    1.5964    1.6103     396.9    310.9s
+1000   4.7e-04    1.4881    1.5240     397.4    414.6s
+...
+3600   5.3e-05    1.2703    1.2892     396.2   1493.0s
+
+3600 steps, 7,549,747,200 tokens in 1493.0 s  (5057 tokens/s)
+saved    modelv3.npz  (best val 1.2521)
+```
+
+## 3. Chat with your model
+
+`chat.py` loads a checkpoint produced by `tiny_gpt.py` and generates from
+it, using the same KV-cached generation path as training (~12x faster than
+recomputing the full context per token).
+
+```
+python chat.py info model.npz                       # what's in the checkpoint
+python chat.py ask model.npz "why is the sky blue?"  # single question, single answer
+python chat.py chat model.npz                        # interactive REPL
+python chat.py sample model.npz --n 800              # free-running generation, no prompt
+python chat.py eval model.npz held_out.txt           # loss / perplexity / bits-per-char
+```
+
+Sampling knobs, available on `ask`, `chat`, and `sample`: `--temp`
+(0 = greedy, below 1 sharpens, above 1 flattens), `--top-k`, `--top-p`
+(nucleus), `--seed`.
+
+Inside `chat`, `/temp 0.2`, `/topk 20`, `/seed 42`, and `/n 20` adjust those
+knobs mid-conversation.
+
+![chat.py interactive REPL session](images/chat-repl.png)
+*Figure 4 — `chat.py chat model.npz`, an interactive session with a trained checkpoint.*
+
+Set expectations accordingly: this is a character-level model, typically
+well under a million parameters. It learns spelling, the `U:`/`A:` turn
+structure, sentence rhythm, and answer shape — it does not learn to reason
+or answer questions correctly. Judge output on whether it reads like English
+dialogue, not on whether it's right.
+
+#### Example `chat.py` session (placeholder)
+
+<!-- TODO: replace with real output from `python chat.py chat model.npz` -->
+
+```
+$ python chat.py chat model.npz
+1,847,392 params, 4 layers, 4 heads, 128 dim, block_size 256
+vocab 97, trained 3600 steps
+val loss 1.2521  (perplexity 3.5, 1.81 bits/char)
+
+Type a message. Blank line or Ctrl-D to quit.
+Commands: /temp 0.2  /topk 20 /seed 42  /n 20
+
+U: why is the sky blue?
+A: The sky appears blue because of the way sunlight is scattered by the
+   atmosphere, with shorter blue wavelengths scattering more than other
+   colors.
+
+[241 chars in 0.31s, 778 chars/s]
+
+U: /temp 0.3
+  temp = 0.3
+
+U: give me a one sentence summary of photosynthesis
+A: Photosynthesis is the process by which plants convert sunlight, water,
+   and carbon dioxide into glucose and oxygen.
+
+[189 chars in 0.24s, 787 chars/s]
+```
+
+To measure a checkpoint quantitatively rather than by eye, run it against a
+held-out text file:
+
+```
+python chat.py eval model.npz held_out.txt
+```
+
+This reports loss, perplexity, and bits-per-character, and warns if the
+file contains characters outside the model's training vocabulary.
+
+## License
+
+Apache License 2.0 — see [LICENSE](LICENSE).
