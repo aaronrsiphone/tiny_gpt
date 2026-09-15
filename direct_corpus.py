@@ -9,7 +9,7 @@ on disk.
 
     python direct_corpus.py list
     python direct_corpus.py dolly
-    python direct_corpus.py alpaca dolly --out big.txt
+    python direct_corpus.py alpaca-cleaned dolly --out big.txt
     python direct_corpus.py all --max-out 600 --out huge.txt
 
 Combining sources is the point. A 5 MB corpus at 8192 tokens/step and 16000
@@ -20,7 +20,7 @@ Output is ASCII-folded identically to alpaca_corpus.py and hf_corpus.py, so
 a model trained on any of them has a vocabulary of exactly printable ASCII
 plus newline, and every corpus is interchangeable for eval.
 
-NOTE: only the alpaca and alpaca-cleaned URLs have been verified reachable.
+NOTE: only the alpaca-cleaned URL has been verified reachable.
 The dolly URL came from the HF file listing and is believed correct but was
 not testable from where this was written. If one 404s, the others still run:
 failures are reported and skipped, not fatal.
@@ -34,11 +34,6 @@ import urllib.request
 
 # (url, cache filename, format, description)
 SOURCES = {
-    'alpaca': (
-        'https://raw.githubusercontent.com/tatsu-lab/stanford_alpaca/'
-        'main/alpaca_data.json',
-        'alpaca_data.json', 'json',
-        '52K GPT-generated instruction/output. CC BY-NC 4.0.'),
     'alpaca-cleaned': (
         'https://raw.githubusercontent.com/gururise/AlpacaDataCleaned/'
         'main/alpaca_data_cleaned.json',
@@ -51,7 +46,7 @@ SOURCES = {
         '15K human-written. CC BY-SA 3.0. Different register from alpaca.'),
 }
 
-ALL = ['alpaca', 'dolly']          # 'all' expands to this
+ALL = ['alpaca-cleaned', 'dolly']  # 'all' expands to this
 
 # Field-name candidates, checked in order.
 USER_KEYS = ['instruction', 'question', 'prompt', 'query']

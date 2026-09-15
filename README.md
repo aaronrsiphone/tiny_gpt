@@ -53,17 +53,16 @@ python direct_corpus.py list
 ```
 sources:
 
-  alpaca          52K GPT-generated instruction/output. CC BY-NC 4.0.
   alpaca-cleaned  52K, community-corrected fork of alpaca. CC BY-NC 4.0.
   dolly           15K human-written. CC BY-SA 3.0. Different register from alpaca.
 
-  all             = alpaca + dolly
+  all             = alpaca-cleaned + dolly
 ```
 
 Build a corpus from one or more sources:
 
 ```
-python direct_corpus.py alpaca dolly --out big.txt
+python direct_corpus.py alpaca-cleaned dolly --out big.txt
 ```
 
 ![direct_corpus.py downloading and assembling a training corpus](images/dataset-build.png)
@@ -117,9 +116,12 @@ than passing command-line flags — whatever you pass on the actual command
 line is discarded. This is the one thing that trips people up on a first
 read of the file.
 
-(The individual mode functions — `gradcheck`, `bench`, `profile` — do
-respect real `argv`, e.g. `python tiny_gpt.py gradcheck --rope 0`; it's only
-`train` that's pinned by the hardcoded block above.)
+The `sys.argv` overwrite happens unconditionally, before the code that reads
+`sys.argv[1]` to pick a mode — so this hardcoding isn't specific to `train`,
+it pins **every** mode. `python tiny_gpt.py gradcheck --rope 0` still runs
+whatever is in the hardcoded list (`train` by default), not `gradcheck`. To
+run `gradcheck`, `bench`, or `profile` with real command-line flags, comment
+out or remove the `sys.argv = [...]` block first.
 
 ### Architecture flags
 
@@ -156,13 +158,13 @@ along with a short sample generation at the end of the run.
 Resuming a run continues the same cosine LR schedule instead of re-warming
 a converged model — set `resume` to a prior checkpoint path.
 
-Two extra modes are useful before committing to a long run:
-
-```
-python tiny_gpt.py gradcheck        # finite-difference check of every gradient
-python tiny_gpt.py bench            # throughput by phase (numpy vs. Accelerate)
-python tiny_gpt.py profile          # per-operation timing breakdown
-```
+Two extra modes are useful before committing to a long run — `gradcheck`
+(finite-difference check of every gradient), `bench` (throughput by phase,
+numpy vs. Accelerate), and `profile` (per-operation timing breakdown). Since
+the hardcoded `sys.argv` block always wins, run them by editing that block
+to `'gradcheck'` / `'bench'` / `'profile'` (and adjusting or removing the
+`train`-only flags below it) rather than passing the mode on the command
+line.
 
 #### Example training log (placeholder)
 
