@@ -4,11 +4,16 @@ Train tiny character-level language models from scratch — no PyTorch, no
 autograd, no pretrained weights — and run them on anything from a laptop to
 an iPhone in Pythonista.
 
-`tiny_gpt.py` is a full GPT (multi-head causal self-attention, real
-backprop) implemented directly over NumPy. On Apple hardware it routes every
-matmul through `cblas_sgemm` on the Accelerate framework's AMX coprocessor;
-everywhere else it falls back to plain NumPy and still runs correctly, just
-slower.
+`tiny_gpt.py` is the entry point to a full GPT (multi-head causal
+self-attention, real backprop) implemented directly over NumPy in the
+`tinygpt/` package. On Apple hardware it routes every matmul through
+`cblas_sgemm` on the Accelerate framework's AMX coprocessor; everywhere else
+it falls back to plain NumPy and still runs correctly, just slower.
+
+The implementation is deliberately split into small, single-purpose files —
+this is meant to be read, not just run. See [Code layout](#code-layout)
+below for a map, or open `tinygpt/__init__.py`, which carries the same map
+as a module docstring.
 
 ![Training tiny_gpt on an iPhone in Pythonista](images/pythonista-ios.png)
 *Figure 1 — `tiny_gpt.py` training a model on-device in Pythonista on iOS.*
@@ -34,8 +39,36 @@ in order:
 | File               | Purpose                                              |
 |--------------------|-------------------------------------------------------|
 | `direct_corpus.py` | Downloads and assembles instruction/response datasets into a training corpus |
-| `tiny_gpt.py`      | The model: forward/backward pass, training loop, checkpointing |
+| `tiny_gpt.py`      | Command-line entry point for training (see [Code layout](#code-layout)) |
+| `tinygpt/`         | The implementation: model, training loop, checkpointing, diagnostics |
 | `chat.py`          | Loads a trained checkpoint and generates, chats, or evaluates it |
+
+### Code layout
+
+`tinygpt/` is split by concern, one file per piece of the system, so each
+can be read (and changed) on its own instead of scrolling through one large
+file:
+
+| File                     | Contents                                                    |
+|--------------------------|---------------------------------------------------------------|
+| `tinygpt/backend.py`     | Accelerate/BLAS bindings — `gemm`, `bmm`, vForce wrappers, the model's working dtype |
+| `tinygpt/ops.py`         | Elementwise math — activations, LayerNorm, RMSNorm, RoPE, softmax, each with a hand-written forward *and* backward |
+| `tinygpt/model.py`       | `Config` and `GPT` — the forward pass, the backward pass, and both sampling paths (cached and uncached) |
+| `tinygpt/optim.py`       | The Adam optimizer |
+| `tinygpt/checkpoint.py`  | Saving/loading `.npz` checkpoints |
+| `tinygpt/data.py`        | Corpus loading, vocabulary, batching |
+| `tinygpt/train.py`       | The training loop |
+| `tinygpt/diagnostics.py` | `gradcheck`, `gradcheck_all`, `bench`, `profile` |
+| `tinygpt/cli.py`         | Argument parsing and mode dispatch |
+
+A reasonable reading order: start at `model.py` to see the GPT itself, then
+`diagnostics.py`'s `gradcheck()` to see how every gradient in `model.py` is
+checked against an independent finite difference, then `train.py` to see
+how the two are put to use.
+
+`chat.py` only depends on one piece of this: `from tinygpt.checkpoint import
+load_checkpoint`. Everything else it does — sampling, the KV cache — lives
+in `GPT` itself and is reached through the loaded model object.
 
 ## 1. Build a dataset
 

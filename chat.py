@@ -30,7 +30,7 @@ import time
 
 import numpy as np
 
-import tiny_gpt as G
+from tinygpt.checkpoint import load_checkpoint
 
 
 # ------------------------------------------------------------------ helpers
@@ -59,7 +59,7 @@ def parse(args, defaults):
 
 
 def load(path):
-    model, stoi, itos, meta = G.load_checkpoint(path)
+    model, stoi, itos, meta = load_checkpoint(path)
     return model, stoi, itos, meta
 
 
