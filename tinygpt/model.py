@@ -452,9 +452,15 @@ class GPT(object):
                       dtype=backend.DT))).astype(backend.DT)
         return logits[0]
 
-    def generate(self, stoi, itos, prompt='\n', n=400, temp=0.8, top_k=40,
+    def generate(self, tok, prompt='\n', n=400, temp=0.8, top_k=40,
                  top_p=None, seed=0, stop=None, on_token=None):
         """Sample with a KV cache. Returns the generated text.
+
+        `tok` is a tokenizer (see tokenizer.py). It is the only thing here
+        that knows what an id means: the prompt goes through tok.encode(),
+        and each sampled id comes back through tok.id_to_token. With a
+        character tokenizer one id is one character; with a token-level one
+        it is a whole lexeme. Nothing below has to change either way.
 
         Verified against the uncached sample(): logits agree to ~1e-07 at
         every position, and sampled sequences are byte-identical for the
@@ -472,7 +478,7 @@ class GPT(object):
         """
         cfg = self.cfg
         rng = np.random.RandomState(seed)
-        ids = [stoi[c] for c in prompt if c in stoi] or [0]
+        ids = tok.encode(prompt) or [0]
         win = cfg.block_size if cfg.rope else None
 
         kv = [(None, None) for _ in range(cfg.n_layer)]
@@ -480,8 +486,8 @@ class GPT(object):
         for j, t in enumerate(ids):
             logits = self._step_cached(t, j, kv, window=win)
         pos = len(ids)
-        if stop:
-            stops = (stop,) if isinstance(stop, str) else tuple(stop)
+        stops = () if not stop else \
+            ((stop,) if isinstance(stop, str) else tuple(stop))
         out = []
         for _ in range(n):
             z = logits.astype(np.float64) / max(temp, 1e-6)
@@ -501,11 +507,11 @@ class GPT(object):
                 pr /= pr.sum()
 
             nxt = int(rng.choice(len(pr), p=pr))
-            ch = itos[nxt]
+            ch = tok.id_to_token[nxt]
             out.append(ch)
             if on_token:
                 on_token(ch)
-            if stop and ''.join(out).endswith(tuple(stop)):
+            if stops and ''.join(out).endswith(stops):
                 break
 
             ids.append(nxt)
@@ -526,11 +532,11 @@ class GPT(object):
 
     # -- sampling -----------------------------------------------------------
 
-    def sample(self, stoi, itos, prompt='\n', n=400, temp=0.8, top_k=40,
+    def sample(self, tok, prompt='\n', n=400, temp=0.8, top_k=40,
                seed=0):
         rng = np.random.RandomState(seed)
-        ids = [stoi.get(c, 0) for c in prompt]
-        out = list(prompt)
+        ids = tok.encode(prompt) or [0]
+        out = [tok.id_to_token[i] for i in ids]
         for _ in range(n):
             ctx = ids[-self.cfg.block_size:]
             idx = np.array([ctx], dtype=np.int64)
@@ -544,5 +550,5 @@ class GPT(object):
             pr /= pr.sum()
             nxt = int(rng.choice(len(pr), p=pr))
             ids.append(nxt)
-            out.append(itos[nxt])
+            out.append(tok.id_to_token[nxt])
         return ''.join(out)

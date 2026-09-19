@@ -19,6 +19,8 @@ changed) on its own:
     optim.py          The Adam optimizer
     checkpoint.py     Saving/loading .npz checkpoints
     data.py           Corpus loading, vocabulary, batching
+    tokenizer.py      Text <-> ids: the tokenizer protocol, CharTokenizer
+    math_tokenizer.py A fixed token-level tokenizer for a math corpus
     train.py          The training loop
     diagnostics.py    gradcheck, gradcheck_all, bench, profile
     cli.py            Argument parsing and mode dispatch
@@ -33,14 +35,17 @@ from tinygpt.backend import HAVE_ACCELERATE, set_dtype
 from tinygpt.checkpoint import CKPT_VERSION, load_checkpoint, save_checkpoint
 from tinygpt.data import batcher, load_corpus, make_vocab
 from tinygpt.diagnostics import bench, gradcheck, gradcheck_all, profile
+from tinygpt.math_tokenizer import MathCorpusTokenizer
 from tinygpt.model import GPT, LEGACY_FLAGS, Config
 from tinygpt.optim import Adam
+from tinygpt.tokenizer import TOKENIZERS, CharTokenizer
 from tinygpt.train import estimate_loss, model_min_val, train
 
 __all__ = [
     'Config', 'GPT', 'LEGACY_FLAGS', 'Adam',
     'CKPT_VERSION', 'save_checkpoint', 'load_checkpoint',
     'load_corpus', 'make_vocab', 'batcher',
+    'CharTokenizer', 'MathCorpusTokenizer', 'TOKENIZERS',
     'train', 'estimate_loss', 'model_min_val',
     'gradcheck', 'gradcheck_all', 'bench', 'profile',
     'HAVE_ACCELERATE', 'set_dtype',

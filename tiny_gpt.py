@@ -32,6 +32,11 @@ Set any of them to 0 (or --act gelu) to A/B a single change against the
 baseline. All six off reproduces the previous architecture exactly, and
 version-1 checkpoints load that way automatically.
 
+--tokenizer picks how text becomes ids: 'char' (one id per character, the
+default) or 'math' (one id per lexeme of a generated math corpus, see
+math_corpus.py). The model is identical either way -- only the vocabulary
+and what one id is worth change.
+
 Falls back to numpy when Accelerate is absent, so the same file runs and
 verifies off-device. Only the GEMM binding differs.
 
@@ -67,6 +72,7 @@ if __name__ == '__main__':
     '--zero-init', '0',
     '--value-residual', '0',
     '--softcap', '0',
+    '--tokenizer', 'char',
     '--ckpt', 'modelv3.npz',
     '--lr', '0.00053'
     ]

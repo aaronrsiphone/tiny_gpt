@@ -16,10 +16,11 @@ import numpy as np
 
 from tinygpt import backend
 from tinygpt.backend import set_dtype
-from tinygpt.data import batcher, load_corpus, make_vocab
+from tinygpt.data import batcher, load_corpus
 from tinygpt.model import Config, GPT, LEGACY_FLAGS
 from tinygpt.ops import act_bwd, act_fwd, layernorm, rms_norm, rope_apply, softmax_rows
 from tinygpt.optim import Adam
+from tinygpt.tokenizer import build as build_tokenizer
 
 
 def gradcheck(**flags):
@@ -146,10 +147,12 @@ def profile(steps=12, B=32, block_size=64, **flags):
     is plain numpy. On an install with no SIMD dispatch that residue can
     dominate a step even though it is a rounding error in the FLOP count.
     """
+    # Throughput is measured on whatever is lying around, character-level:
+    # the point is ms/step at a given shape, not what the ids mean.
     text, _ = load_corpus(None)
-    stoi, _ = make_vocab(text)
-    data = np.array([stoi[c] for c in text], dtype=np.int64)
-    cfg = Config(vocab=len(stoi), block_size=block_size, **flags)
+    tok = build_tokenizer('char', text)
+    data = np.array(tok.encode(text), dtype=np.int64)
+    cfg = Config(vocab=tok.vocab_size, block_size=block_size, **flags)
     model = GPT(cfg)
     opt = Adam(model.p)
     rng = np.random.RandomState(0)
@@ -238,9 +241,9 @@ def bench(steps=20, B=32, **flags):
 
 def _bench_one(steps=20, B=32, **flags):
     text, _ = load_corpus(None)
-    stoi, _ = make_vocab(text)
-    data = np.array([stoi[c] for c in text], dtype=np.int64)
-    cfg = Config(vocab=len(stoi), **flags)
+    tok = build_tokenizer('char', text)
+    data = np.array(tok.encode(text), dtype=np.int64)
+    cfg = Config(vocab=tok.vocab_size, **flags)
     model = GPT(cfg)
     opt = Adam(model.p)
     rng = np.random.RandomState(0)

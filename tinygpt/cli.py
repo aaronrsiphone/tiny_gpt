@@ -18,7 +18,7 @@ import sys
 from tinygpt.diagnostics import bench, gradcheck, gradcheck_all, profile
 from tinygpt.train import train
 
-_STR_KEYS = ('ckpt', 'resume', 'act')
+_STR_KEYS = ('ckpt', 'resume', 'act', 'tokenizer')
 
 
 def parse_kv(args, start=0):

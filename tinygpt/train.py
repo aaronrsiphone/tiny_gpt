@@ -10,9 +10,10 @@ import numpy as np
 
 from tinygpt import backend
 from tinygpt.checkpoint import load_checkpoint, save_checkpoint
-from tinygpt.data import batcher, load_corpus, make_vocab
+from tinygpt.data import batcher, load_corpus
 from tinygpt.model import Config, GPT
 from tinygpt.optim import Adam
+from tinygpt.tokenizer import build as build_tokenizer
 
 
 def estimate_loss(model, data, B, batches=20, seed=1234):
@@ -37,10 +38,11 @@ def model_min_val(data, frac):
 def train(path=None, steps=2000, B=32, lr=2e-3, seed=0, block_size=None,
           n_layer=4, n_head=4, n_embd=128, ckpt='model.npz',
           ckpt_every=250, val_frac=0.05, resume=None, rope=1, qk_norm=1,
-          act='relu2', zero_init=1, value_residual=1, softcap=30.0):
+          act='relu2', zero_init=1, value_residual=1, softcap=30.0,
+          tokenizer='char'):
     text, src = load_corpus(path)
-    stoi, itos = make_vocab(text)
-    data = np.array([stoi[c] for c in text], dtype=np.int64)
+    tok = build_tokenizer(tokenizer, text)
+    data = np.array(tok.encode(text), dtype=np.int64)
 
     # Held-out tail. A char model on a few MB overfits readily, and train
     # loss alone will keep dropping while the model memorises the corpus.
@@ -49,15 +51,20 @@ def train(path=None, steps=2000, B=32, lr=2e-3, seed=0, block_size=None,
         (data, None)
 
     if resume:
-        model, stoi_r, itos_r, meta, opt = load_checkpoint(
-            resume, with_optimizer=True)
-        if stoi_r != stoi:
+        model, tok_r, meta, opt = load_checkpoint(resume, with_optimizer=True)
+        if tok_r.name != tok.name:
+            raise SystemExit(
+                'resume tokenizer is %r but this run asked for %r: the ids '
+                'mean different things, so the checkpoint\'s embedding rows '
+                'do not apply. Use the same tokenizer or start fresh.'
+                % (tok_r.name, tok.name))
+        if tok_r.token_to_id != tok.token_to_id:
             raise SystemExit(
                 'resume vocabulary differs from this corpus: the checkpoint '
                 'was trained on a different text, so its embedding rows do '
-                'not match these character ids. Train on the same corpus or '
+                'not match these ids. Train on the same corpus or '
                 'start fresh.')
-        stoi, itos = stoi_r, itos_r
+        tok = tok_r
         start = int(meta.get('step', 0))
         cfg = model.cfg
         # Continue the cosine where it stopped rather than re-warming a
@@ -69,7 +76,7 @@ def train(path=None, steps=2000, B=32, lr=2e-3, seed=0, block_size=None,
         print('resumed  %s at step %d (schedule %d/%d)'
               % (resume, start, k0, total))
     else:
-        cfg = Config(vocab=len(stoi), n_layer=n_layer, n_head=n_head,
+        cfg = Config(vocab=tok.vocab_size, n_layer=n_layer, n_head=n_head,
                      n_embd=n_embd, block_size=block_size or 64,
                      rope=rope, qk_norm=qk_norm, act=act,
                      zero_init=zero_init, value_residual=value_residual,
@@ -80,8 +87,9 @@ def train(path=None, steps=2000, B=32, lr=2e-3, seed=0, block_size=None,
         k0, total = 0, steps
 
     print('corpus   %s' % src)
-    print('chars    %d train / %d val   vocab %d'
-          % (len(train_data), n_val, cfg.vocab))
+    print('tokens   %d train / %d val   vocab %d  (%s, %.2f chars/token)'
+          % (len(train_data), n_val, cfg.vocab, tok.name,
+             len(text) / max(len(data), 1)))
     print('model    %d params  (%d layers, %d heads, %d dim, block %d)'
           % (model.n_params, cfg.n_layer, cfg.n_head, cfg.n_embd,
              cfg.block_size))
@@ -120,7 +128,7 @@ def train(path=None, steps=2000, B=32, lr=2e-3, seed=0, block_size=None,
                   % (s, cur, loss, vl, el / (j + 1) * 1000.0, el))
             if not (vl == vl) or vl < best:       # nan-safe
                 best = vl
-                save_checkpoint(ckpt, model, stoi, step=s + 1, opt=opt,
+                save_checkpoint(ckpt, model, tok, step=s + 1, opt=opt,
                                 val_loss=None if vl != vl else float(vl),
                                 sched=(k + 1, total))
         elif j % 100 == 0:
@@ -129,13 +137,13 @@ def train(path=None, steps=2000, B=32, lr=2e-3, seed=0, block_size=None,
                   % (s, cur, loss, '-', el / (j + 1) * 1000.0, el))
 
     dt = time.time() - t0
-    tok = steps * B * cfg.block_size
+    n_tok = steps * B * cfg.block_size
     print('\n%d steps, %d tokens in %.1f s  (%.0f tokens/s)'
-          % (steps, tok, dt, tok / dt))
+          % (steps, n_tok, dt, n_tok / dt))
     print('%.1f GFLOP/s sustained end-to-end'
-          % (6.0 * model.n_params * tok / dt / 1e9))
+          % (6.0 * model.n_params * n_tok / dt / 1e9))
     print('saved    %s  (best val %.4f)' % (ckpt, best))
 
     print('\n' + '-' * 60)
-    print(model.generate(stoi, itos, prompt='\n', n=600))
+    print(model.generate(tok, prompt='\n', n=600))
     print('-' * 60)
