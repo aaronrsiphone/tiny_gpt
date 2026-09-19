@@ -2,6 +2,12 @@
 '''
 A fixed, hand-written tokenizer for a generated math corpus.
 
+Every token is ASCII. That is a constraint from the keyboard, not the maths:
+the corpus is written and read on an iOS device, where * is one tap and the
+typographic multiplication and division signs are not. So multiplication is
+*, dividing one fraction by another is parenthesised -- (2/3) / (4/5) --
+and "about equal" is ~=.
+
 Unlike the character tokenizer, this one's vocabulary does not depend on
 the corpus at all: it is a closed list of lexemes the generator is known to
 emit. That has two consequences worth understanding before training on it:
@@ -156,17 +162,72 @@ class MathCorpusTokenizer:
 
         "solve": "<solve>",
         "or": "<or>",
+
+        # ------------------------------------------------------------------
+        # Calculus
+        # ------------------------------------------------------------------
+
+        "integral": "<integral>",
+        "antiderivative": "<antiderivative>",
+        "dx": "<dx>",
+        "evaluate": "<evaluate>",
+
+        "derivative": "<derivative>",
+        "d/dx": "<d_dx>",
+        "power rule": "<power_rule>",
+        "exponent": "<exponent>",
+
+        # ------------------------------------------------------------------
+        # Series, counting, approximation
+        # ------------------------------------------------------------------
+
+        "factorial": "<factorial>",
+        "summation": "<summation>",
+
+        "estimate": "<estimate>",
+        "round": "<round>",
+        "~=": "<about_equal>",
+
+        # ------------------------------------------------------------------
+        # Comparison
+        #
+        # The < and > glyphs carry the relation inside an expression; these
+        # words carry it in prose, which is how the answers read.
+        # ------------------------------------------------------------------
+
+        "less than": "<less_than>",
+        "greater than": "<greater_than>",
+        "inequality": "<inequality>",
+        "flip": "<flip>",
+
+        # ------------------------------------------------------------------
+        # Piecewise definitions
+        # ------------------------------------------------------------------
+
+        "piecewise": "<piecewise>",
+        "function": "<function>",
+        "if": "<if>",
+        "otherwise": "<otherwise>",
     }
 
     # Numbers deliberately remain digit-level.
+    #
+    # ASCII only, deliberately: this corpus is written and read on an iOS
+    # keyboard, where * is one tap and the typographic multiplication and
+    # division signs are a trip through a symbol palette. So multiplication
+    # is *, and dividing one fraction by another is parenthesised --
+    # (2/3) / (4/5) -- which needs no second division glyph and stays
+    # unambiguous once tokenized.
     SYMBOLS = tuple("0123456789") + (
         "x",
+        "f",
         "+",
         "-",
-        "×",
-        "÷",
-        "=",
+        "*",
         "/",
+        "=",
+        "<",
+        ">",
         "(",
         ")",
         ":",
@@ -175,6 +236,7 @@ class MathCorpusTokenizer:
         "{",
         "}",
         "^",
+        "!",
     )
 
     def __init__(self, strict: bool = True):
