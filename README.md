@@ -301,27 +301,39 @@ constraint of the model — `GPT` only ever sees integer ids and a vocabulary
 size, so a different tokenizer needs no changes in `tinygpt/model.py` at all.
 
 `tinygpt/math_tokenizer.py` is the other extreme: a **fixed** vocabulary of
-87 tokens for a generated math corpus. Whole phrases collapse into single
+111 tokens for a generated math corpus. Whole phrases collapse into single
 ids, digits stay separate, and spaces are discarded entirely:
 
 ```
 U: Solve for x: 3(x - 7) - 8 = -23      ->  <u><solve_for>x:3(x-7)-8=-23
 ```
 
+Every token is ASCII, which is a constraint from the keyboard rather than
+the maths: this corpus gets written and read on an iOS device, where `*` is
+one tap and `×` is a trip through a symbol palette. So multiplication is
+`*`, dividing one fraction by another is parenthesised — `(2/3) / (4/5)` —
+and "about equal" is `~=`.
+
 Generate a corpus and train on it:
 
 ```
-python math_corpus.py list                     # the 15 problem kinds
+python math_corpus.py list                     # the 22 problem kinds
 python math_corpus.py --n 4000 --out math.txt
 ```
 
 The kinds span one-step arithmetic (signed integers, subtracting a negative,
-decimals, multiplication as repeated addition) through fraction work
-(common denominators, multiplying, dividing by the reciprocal, cancelling)
-to multi-step algebra (two-step, collecting like terms, variables on both
-sides, distributing, factoring, difference of squares). Generation prints
-which vocabulary tokens no kind reaches yet — that list is the to-do list
-for adding more.
+decimals, estimation by rounding, multiplication as repeated addition)
+through fraction work (common denominators, multiplying, dividing by the
+reciprocal, cancelling) and multi-step algebra (two-step, collecting like
+terms, variables on both sides, distributing, factoring, difference of
+squares, inequalities that flip when divided by a negative) to notation that
+needs more than arithmetic: factorials, summations in closed form, piecewise
+branch selection, derivatives by the power rule, and definite integrals.
+
+Generation prints which vocabulary tokens no kind reaches yet. That list is
+the honest to-do list: right now only `<pad>`, `<bos>`, `<eos>` and `<unk>`
+are unused, and those four are unreachable by design because the
+flat-stream trainer has no sequence boundaries to mark.
 
 Then set `'--tokenizer', 'math'` and `'math.txt'` in `tiny_gpt.py`'s
 hardcoded argv block (see [above](#important-how-this-script-takes-its-arguments))
@@ -350,8 +362,11 @@ Three things are worth noticing when you run this:
 - **Structure is learned long before arithmetic.** After a few hundred steps
   the model reproduces every template perfectly — step numbering, turn
   markers, the shape of each solution — while the numbers inside stay wrong
-  (`6×4=10`). The scaffolding is a much easier distribution than the
-  computation it describes.
+  (`6*4=10`, `Round 47 to 70`). The scaffolding is a much easier distribution
+  than the computation it describes. Individual facts do get memorised where
+  the answer table is small — `3!` and `4!` come out right — but that is
+  recall, not a rule: the same checkpoint gets `d/dx 9x^5` half right
+  (`45x^3`, correct coefficient, wrong exponent) and `d/dx 2x^4` wrong.
 
 #### Example math session (placeholder)
 
@@ -359,8 +374,8 @@ Three things are worth noticing when you run this:
 
 ```
 $ python chat.py info math.npz
-352,418 params, 3 layers, 4 heads, 96 dim, block_size 64
-vocab 87 (math tokenizer), trained 3600 steps
+352,418 params, 3 layers, 4 heads, 96 dim, block_size 96
+vocab 111 (math tokenizer), trained 3600 steps
 val loss 0.2104  (perplexity 1.2, 0.30 bits/token)
 
 $ python chat.py ask math.npz "Solve for x: 5x + 4 = 19" --temp 0.3

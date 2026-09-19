@@ -80,6 +80,24 @@ def frac(num, den):
     return '%d' % num if den == 1 else '%d/%d' % (num, den)
 
 
+def mono(coef, power):
+    '''"12x^2", "12x", "12": a monomial with the redundant parts dropped.
+
+    x^1 and x^0 are never written out, because nobody writes them and a
+    model trained on "12x^1" would learn to.
+    '''
+    if power == 0:
+        return '%d' % coef
+    if power == 1:
+        return term(coef)
+    return '%s^%d' % (term(coef), power)
+
+
+def round_ten(n):
+    '''Nearest ten, in integers so there is no float rounding to argue with.'''
+    return ((n + 5) // 10) * 10
+
+
 def move_constant(k, coeff, rhs):
     '''The step that clears a constant from the left side.
 
@@ -166,11 +184,11 @@ def order_of_ops(rng):
     inner = c - d
     prod = b * inner
 
-    problem = 'Compute %d + %d × (%d - %d)' % (a, b, c, d)
+    problem = 'Compute %d + %d * (%d - %d)' % (a, b, c, d)
     answer = '\n'.join([
         'Step 1: Use order of operations, so first compute %d - %d = %d'
         % (c, d, inner),
-        'Step 2: Multiply %d × %d = %d' % (b, inner, prod),
+        'Step 2: Multiply %d * %d = %d' % (b, inner, prod),
         'Step 3: Add %d + %d = %d' % (a, prod, a + prod),
         'Final answer: %d' % (a + prod),
     ])
@@ -206,9 +224,9 @@ def divide_fractions(rng):
     c, d = rng.randint(1, 9), rng.randint(2, 9)
     num, den = a * d, b * c
 
-    problem = 'Compute %d/%d ÷ %d/%d' % (a, b, c, d)
+    problem = 'Compute (%d/%d) / (%d/%d)' % (a, b, c, d)
     steps = [
-        'Step 1: Multiply by its reciprocal, so %d/%d × %s'
+        'Step 1: Multiply by its reciprocal, so %d/%d * %s'
         % (a, b, frac(d, c)),
         'Step 2: Multiply numerators and denominators, so %s'
         % frac(num, den),
@@ -320,9 +338,9 @@ def groups_of(rng):
     a = rng.randint(2, 5)
     b = rng.randint(2, 9)
 
-    problem = 'Compute %d × %d' % (a, b)
+    problem = 'Compute %d * %d' % (a, b)
     answer = '\n'.join([
-        'Step 1: %d × %d is the same as %d groups of %d' % (a, b, a, b),
+        'Step 1: %d * %d is the same as %d groups of %d' % (a, b, a, b),
         'Step 2: Adding %s, so %d' % (' and '.join([str(b)] * a), a * b),
         'Final answer: %d' % (a * b),
     ])
@@ -349,7 +367,7 @@ def multiply_fractions(rng):
     r, s = rng.randint(1, 9), rng.randint(2, 9)
     num, den = p * r, q * s
 
-    problem = 'Compute %d/%d × %d/%d' % (p, q, r, s)
+    problem = 'Compute %d/%d * %d/%d' % (p, q, r, s)
     steps = ['Step 1: Multiplying numerators and denominators, so %s'
              % frac(num, den)]
     tail, final = reduce_steps(num, den, 2)
@@ -393,6 +411,140 @@ def difference_of_squares(rng):
     return problem, answer
 
 
+def factorial(rng):
+    '''n!, expanded and multiplied out one pair at a time'''
+    n = rng.randint(3, 6)
+
+    chain = ' * '.join(str(k) for k in range(n, 0, -1))
+    steps = ['Step 1: %d factorial is the same as %s' % (n, chain)]
+    total = n
+    for i, k in enumerate(range(n - 1, 0, -1)):
+        steps.append('Step %d: Multiply %d * %d = %d'
+                     % (i + 2, total, k, total * k))
+        total *= k
+
+    return 'Compute %d!' % n, '\n'.join(steps + ['Final answer: %d' % total])
+
+
+def derivative(rng):
+    '''d/dx of a single power, by the power rule'''
+    a = rng.randint(2, 9)
+    e = rng.randint(2, 5)
+
+    problem = 'Find the derivative of %s' % mono(a, e)
+    answer = '\n'.join([
+        'Step 1: Use the power rule, so multiply by the exponent %d' % e,
+        'Step 2: Multiply %d by %d = %d' % (a, e, a * e),
+        'Step 3: Subtract 1 from the exponent, leaving %d' % (e - 1),
+        'Final answer: d/dx %s = %s' % (mono(a, e), mono(a * e, e - 1)),
+    ])
+    return problem, answer
+
+
+def integral(rng):
+    '''A definite integral of one power, coefficient chosen to divide evenly'''
+    e = rng.randint(1, 4)
+    k = rng.randint(1, 4)
+    a = k * (e + 1)
+    lo = rng.randint(0, 2)
+    hi = lo + rng.randint(1, 3)
+    top, bottom = k * hi ** (e + 1), k * lo ** (e + 1)
+
+    problem = 'Compute the integral of %s dx from %d to %d' \
+        % (mono(a, e), lo, hi)
+    answer = '\n'.join([
+        'Step 1: Find the antiderivative, so add 1 to the exponent, '
+        'leaving %d' % (e + 1),
+        'Step 2: Divide %d by %d, so the antiderivative is %s'
+        % (a, e + 1, mono(k, e + 1)),
+        'Step 3: Evaluate %s from %d to %d, so %d - %d'
+        % (mono(k, e + 1), lo, hi, top, bottom),
+        'Final answer: %d' % (top - bottom),
+    ])
+    return problem, answer
+
+
+def summation(rng):
+    '''1 + 2 + ... + n by the closed form, not by adding n things'''
+    n = rng.randint(4, 20)
+    prod = n * (n + 1)
+
+    problem = 'Compute the summation from 1 to %d' % n
+    answer = '\n'.join([
+        'Step 1: Multiply %d by %d, so %d' % (n, n + 1, prod),
+        'Step 2: Divide %d by 2, leaving %d' % (prod, prod // 2),
+        'Final answer: %d' % (prod // 2),
+    ])
+    return problem, answer
+
+
+def inequality(rng):
+    '''a*x + b < c, including the flip when a is negative'''
+    bound = rng.randint(-9, 9)
+    a = rng.randint(2, 9) * rng.choice([1, -1])
+    b = rng.randint(-9, 9) or 2
+    c = a * bound + b
+
+    move = ('Subtract %d from both sides' % b) if b > 0 else \
+           ('Add %d to both sides' % -b)
+    problem = 'Solve %s %s < %d' % (term(a), signed(b), c)
+
+    if a > 0:
+        # Dividing by a positive leaves the relation alone.
+        divide = 'Divide both sides by %d, so x < %d' % (a, bound)
+        words = 'x is less than %d' % bound
+    else:
+        # Dividing by a negative reverses it -- the one rule here that
+        # solving an equation never has to care about.
+        divide = 'Divide both sides by %d and flip the inequality, ' \
+                 'so x > %d' % (a, bound)
+        words = 'x is greater than %d' % bound
+
+    answer = '\n'.join([
+        'Step 1: %s, so %s < %d' % (move, term(a), c - b),
+        'Step 2: %s' % divide,
+        'Final answer: %s' % words,
+    ])
+    return problem, answer
+
+
+def piecewise(rng):
+    '''Pick the branch, then evaluate it'''
+    low = rng.randint(2, 9)
+    high = rng.randint(2, 9)
+    x = rng.randint(-9, 9)
+    while x == 0:
+        x = rng.randint(-9, 9)
+
+    coef = low if x < 0 else high
+    side = 'less' if x < 0 else 'greater'
+
+    problem = ('The piecewise function f(x) = {%s if x < 0, %s otherwise}. '
+               'Compute f(%d)' % (term(low), term(high), x))
+    answer = '\n'.join([
+        'Step 1: %d is %s than 0, so use %s' % (x, side, term(coef)),
+        'Step 2: Multiply %d by %d, so %d' % (coef, x, coef * x),
+        'Final answer: %d' % (coef * x),
+    ])
+    return problem, answer
+
+
+def estimate(rng):
+    '''Round both addends to the nearest ten, then add'''
+    a = rng.randint(11, 89)
+    b = rng.randint(11, 89)
+    ra, rb = round_ten(a), round_ten(b)
+
+    problem = 'Estimate %d + %d' % (a, b)
+    answer = '\n'.join([
+        'Step 1: Round %d to %d' % (a, ra),
+        'Step 2: Round %d to %d' % (b, rb),
+        'Step 3: Add %d + %d = %d' % (ra, rb, ra + rb),
+        'Final answer: %d + %d ~= %d' % (a, b, ra + rb),
+    ])
+    return problem, answer
+
+
 KINDS = {
     'linear': (two_step, 'a*x + b = c, two steps'),
     'terms': (like_terms, 'collect a*x + c*x and the constant terms first'),
@@ -409,6 +561,13 @@ KINDS = {
     'decimals': (decimals, 'decimal addition and subtraction, two places'),
     'quadratic': (quadratic, 'factor x^2 + bx + c = 0'),
     'squares': (difference_of_squares, 'x^2 = r^2, answered as a set'),
+    'inequality': (inequality, 'a*x + b < c, flipping when a is negative'),
+    'piecewise': (piecewise, 'pick a branch of f(x) and evaluate it'),
+    'factorial': (factorial, 'n! expanded and multiplied out'),
+    'summation': (summation, '1 + 2 + ... + n by the closed form'),
+    'estimate': (estimate, 'round to the nearest ten, then add'),
+    'derivative': (derivative, 'd/dx of a power, by the power rule'),
+    'integral': (integral, 'a definite integral of a single power'),
 }
 
 ALL = sorted(KINDS)
