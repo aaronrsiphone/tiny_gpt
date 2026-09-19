@@ -4,11 +4,16 @@ Train tiny character-level language models from scratch — no PyTorch, no
 autograd, no pretrained weights — and run them on anything from a laptop to
 an iPhone in Pythonista.
 
-`tiny_gpt.py` is a full GPT (multi-head causal self-attention, real
-backprop) implemented directly over NumPy. On Apple hardware it routes every
-matmul through `cblas_sgemm` on the Accelerate framework's AMX coprocessor;
-everywhere else it falls back to plain NumPy and still runs correctly, just
-slower.
+`tiny_gpt.py` is the entry point to a full GPT (multi-head causal
+self-attention, real backprop) implemented directly over NumPy in the
+`tinygpt/` package. On Apple hardware it routes every matmul through
+`cblas_sgemm` on the Accelerate framework's AMX coprocessor; everywhere else
+it falls back to plain NumPy and still runs correctly, just slower.
+
+The implementation is deliberately split into small, single-purpose files —
+this is meant to be read, not just run. See [Code layout](#code-layout)
+below for a map, or open `tinygpt/__init__.py`, which carries the same map
+as a module docstring.
 
 ![Training tiny_gpt on an iPhone in Pythonista](images/pythonista-ios.png)
 *Figure 1 — `tiny_gpt.py` training a model on-device in Pythonista on iOS.*
@@ -19,6 +24,9 @@ in order:
 1. [Build a dataset](#1-build-a-dataset) with `direct_corpus.py`
 2. [Train a model](#2-train-a-model) with `tiny_gpt.py`
 3. [Chat with your model](#3-chat-with-your-model) with `chat.py`
+
+Then, if you want to change what a token *is*:
+[swapping the tokenizer](#4-swapping-the-tokenizer-a-token-level-math-model).
 
 ## Requirements
 
@@ -34,8 +42,39 @@ in order:
 | File               | Purpose                                              |
 |--------------------|-------------------------------------------------------|
 | `direct_corpus.py` | Downloads and assembles instruction/response datasets into a training corpus |
-| `tiny_gpt.py`      | The model: forward/backward pass, training loop, checkpointing |
+| `math_corpus.py`   | Generates a math worked-solution corpus for the token-level tokenizer |
+| `tiny_gpt.py`      | Command-line entry point for training (see [Code layout](#code-layout)) |
+| `tinygpt/`         | The implementation: model, training loop, checkpointing, diagnostics |
 | `chat.py`          | Loads a trained checkpoint and generates, chats, or evaluates it |
+
+### Code layout
+
+`tinygpt/` is split by concern, one file per piece of the system, so each
+can be read (and changed) on its own instead of scrolling through one large
+file:
+
+| File                     | Contents                                                    |
+|--------------------------|---------------------------------------------------------------|
+| `tinygpt/backend.py`     | Accelerate/BLAS bindings — `gemm`, `bmm`, vForce wrappers, the model's working dtype |
+| `tinygpt/ops.py`         | Elementwise math — activations, LayerNorm, RMSNorm, RoPE, softmax, each with a hand-written forward *and* backward |
+| `tinygpt/model.py`       | `Config` and `GPT` — the forward pass, the backward pass, and both sampling paths (cached and uncached) |
+| `tinygpt/optim.py`       | The Adam optimizer |
+| `tinygpt/checkpoint.py`  | Saving/loading `.npz` checkpoints |
+| `tinygpt/data.py`        | Corpus loading, vocabulary, batching |
+| `tinygpt/tokenizer.py`   | Text ↔ ids: the tokenizer protocol and `CharTokenizer` |
+| `tinygpt/math_tokenizer.py` | A fixed token-level tokenizer for a generated math corpus |
+| `tinygpt/train.py`       | The training loop |
+| `tinygpt/diagnostics.py` | `gradcheck`, `gradcheck_all`, `bench`, `profile` |
+| `tinygpt/cli.py`         | Argument parsing and mode dispatch |
+
+A reasonable reading order: start at `model.py` to see the GPT itself, then
+`diagnostics.py`'s `gradcheck()` to see how every gradient in `model.py` is
+checked against an independent finite difference, then `train.py` to see
+how the two are put to use.
+
+`chat.py` only depends on one piece of this: `from tinygpt.checkpoint import
+load_checkpoint`. Everything else it does — sampling, the KV cache — lives
+in `GPT` itself and is reached through the loaded model object.
 
 ## 1. Build a dataset
 
@@ -251,8 +290,83 @@ held-out text file:
 python chat.py eval model.npz held_out.txt
 ```
 
-This reports loss, perplexity, and bits-per-character, and warns if the
-file contains characters outside the model's training vocabulary.
+This reports loss, perplexity, and bits-per-token, and warns if the file
+contains characters outside the model's training vocabulary.
+
+## 4. Swapping the tokenizer: a token-level math model
+
+Everything above is character-level: one id per character, vocabulary taken
+from whatever the corpus happened to contain. That is a choice, not a
+constraint of the model — `GPT` only ever sees integer ids and a vocabulary
+size, so a different tokenizer needs no changes in `tinygpt/model.py` at all.
+
+`tinygpt/math_tokenizer.py` is the other extreme: a **fixed** vocabulary of
+87 tokens for a generated math corpus. Whole phrases collapse into single
+ids, digits stay separate, and spaces are discarded entirely:
+
+```
+U: Solve for x: 3(x - 7) - 8 = -23      ->  <u><solve_for>x:3(x-7)-8=-23
+```
+
+Generate a corpus and train on it:
+
+```
+python math_corpus.py list                     # the problem kinds
+python math_corpus.py --n 4000 --out math.txt
+```
+
+Then set `'--tokenizer', 'math'` and `'math.txt'` in `tiny_gpt.py`'s
+hardcoded argv block (see [above](#important-how-this-script-takes-its-arguments))
+and run it. Chatting works exactly as before — the tokenizer travels inside
+the checkpoint, so `chat.py` needs no flag:
+
+```
+python chat.py ask math.npz "Solve for x: 5x + 4 = 19"
+```
+
+![A token-level math model answering in chat.py](images/math-tokenizer-chat.png)
+*Figure 5 — the math model's reply, shown in the tokenizer's compact form: one id per lexeme, no spaces.*
+
+Three things are worth noticing when you run this:
+
+- **The corpus and the tokenizer are one contract.** `strict=True` means the
+  tokenizer raises on any word it was never taught, so `math_corpus.py`
+  tokenizes the entire corpus before writing it. A template using an unknown
+  word fails at generation time, naming the word, instead of silently
+  becoming `<unk>` or failing mid-training.
+- **Bits-per-token is not bits-per-character.** A token-level model predicts
+  fewer, larger units (~2.8 chars/token here), so its loss is not comparable
+  to a character model's. `chat.py eval` prints both for exactly this reason.
+- **Structure is learned long before arithmetic.** After a few hundred steps
+  the model reproduces every template perfectly — step numbering, turn
+  markers, the shape of each solution — while the numbers inside stay wrong
+  (`6×4=10`). The scaffolding is a much easier distribution than the
+  computation it describes.
+
+#### Example math session (placeholder)
+
+<!-- TODO: replace with real output from a trained math checkpoint -->
+
+```
+$ python chat.py info math.npz
+352,418 params, 3 layers, 4 heads, 96 dim, block_size 64
+vocab 87 (math tokenizer), trained 3600 steps
+val loss 0.2104  (perplexity 1.2, 0.30 bits/token)
+
+$ python chat.py ask math.npz "Solve for x: 5x + 4 = 19" --temp 0.3
+A: <step>1:<subtract>4<from><both_sides>,<so>5x=15<nl>
+   <step>2:<divide><both_sides><by>5,<so>x=3<nl>
+   <final_answer>:x=3
+```
+
+Out-of-language input is refused rather than mangled, because a fixed
+vocabulary has no honest way to represent it:
+
+```
+$ python chat.py ask math.npz "why is the sky blue?"
+the math tokenizer has no rule for: whyskblue?
+it only knows the language its corpus is generated in.
+```
 
 ## License
 

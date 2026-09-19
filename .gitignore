@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.npz
+corpus.txt
+big.txt
