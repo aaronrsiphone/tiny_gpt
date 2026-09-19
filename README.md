@@ -311,9 +311,17 @@ U: Solve for x: 3(x - 7) - 8 = -23      ->  <u><solve_for>x:3(x-7)-8=-23
 Generate a corpus and train on it:
 
 ```
-python math_corpus.py list                     # the problem kinds
+python math_corpus.py list                     # the 15 problem kinds
 python math_corpus.py --n 4000 --out math.txt
 ```
+
+The kinds span one-step arithmetic (signed integers, subtracting a negative,
+decimals, multiplication as repeated addition) through fraction work
+(common denominators, multiplying, dividing by the reciprocal, cancelling)
+to multi-step algebra (two-step, collecting like terms, variables on both
+sides, distributing, factoring, difference of squares). Generation prints
+which vocabulary tokens no kind reaches yet — that list is the to-do list
+for adding more.
 
 Then set `'--tokenizer', 'math'` and `'math.txt'` in `tiny_gpt.py`'s
 hardcoded argv block (see [above](#important-how-this-script-takes-its-arguments))
@@ -333,7 +341,9 @@ Three things are worth noticing when you run this:
   tokenizer raises on any word it was never taught, so `math_corpus.py`
   tokenizes the entire corpus before writing it. A template using an unknown
   word fails at generation time, naming the word, instead of silently
-  becoming `<unk>` or failing mid-training.
+  becoming `<unk>` or failing mid-training. Adding a kind that reuses
+  existing lexemes is therefore free; teaching the tokenizer a *new* word
+  renumbers the vocabulary and invalidates every existing checkpoint.
 - **Bits-per-token is not bits-per-character.** A token-level model predicts
   fewer, larger units (~2.8 chars/token here), so its loss is not comparable
   to a character model's. `chat.py eval` prints both for exactly this reason.

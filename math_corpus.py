@@ -12,6 +12,14 @@ must be inside it. That is checked, not assumed -- the whole corpus is
 tokenized with strict=True before it is written, so a template using a word
 the tokenizer was never taught fails here rather than at training time.
 
+Which is also how to add a problem kind. Write it using only words already
+in math_tokenizer.LEXEMES and the run reports nothing unusual; every kind
+below was written that way, so no checkpoint is invalidated by adding them.
+The "unused" line printed at the end lists lexemes no kind reaches yet,
+which is the honest to-do list. Teaching the tokenizer a *new* word is the
+expensive move: it renumbers the vocabulary, and every checkpoint trained
+before the edit stops loading (by design -- see tokenizer.from_vocab).
+
 Unlike direct_corpus.py, nothing is downloaded: the problems are generated,
 so the answers are correct by construction and the language stays closed.
 
@@ -43,6 +51,63 @@ def lcm(a, b):
 def signed(n):
     '''" + 5" or " - 5": how a term reads inside an expression.'''
     return '+ %d' % n if n >= 0 else '- %d' % (-n)
+
+
+def dec(cents):
+    '''Hundredths as a decimal string.
+
+    The arithmetic stays in integer hundredths from end to end, so no float
+    rounding can reach the corpus: 0.1 + 0.2 must read as 0.30, and a model
+    trained on 0.30000000000000004 would be learning a bug.
+    '''
+    sign = '-' if cents < 0 else ''
+    whole, frac = divmod(abs(cents), 100)
+    return '%s%d.%02d' % (sign, whole, frac)
+
+
+def term(n):
+    '''"x" or "3x": a coefficient on x, with the redundant 1 dropped.'''
+    return 'x' if n == 1 else '%dx' % n
+
+
+def signed_term(n):
+    '''"+ x" or "- 3x": how a coefficient on x reads inside an expression.'''
+    return '%s %s' % ('+' if n >= 0 else '-', term(abs(n)))
+
+
+def frac(num, den):
+    '''"3/4", or just "3" once the denominator has cancelled away.'''
+    return '%d' % num if den == 1 else '%d/%d' % (num, den)
+
+
+def move_constant(k, coeff, rhs):
+    '''The step that clears a constant from the left side.
+
+    Written once because four problem kinds need it, and the wording has to
+    follow the sign: you subtract a positive constant and add a negative
+    one. Returns the step text.
+    '''
+    verb = ('Subtract %d from both sides' % k) if k > 0 else \
+           ('Add %d to both sides' % -k)
+    return '%s, so %s = %d' % (verb, term(coeff), rhs - k)
+
+
+def reduce_steps(num, den, step):
+    '''The cancelling steps for num/den, numbered from `step`.
+
+    Every fraction kind ends through here, for two reasons: the wording of
+    "contains a factor of g" and "cancel the g" is then identical wherever
+    it appears, and no kind can accidentally stop on an answer that still
+    reduces. Returns (steps, final text).
+    '''
+    g = gcd(num, den)
+    if g == 1:
+        return [], frac(num, den)
+    return ([
+        'Step %d: The fraction contains a factor of %d' % (step, g),
+        'Step %d: Cancel the %d, leaving %s'
+        % (step + 1, g, frac(num // g, den // g)),
+    ], frac(num // g, den // g))
 
 
 # --------------------------------------------------------------- generators
@@ -124,15 +189,15 @@ def add_fractions(rng):
     num = p * (l // a) + q * (l // b)
 
     problem = 'Compute %d/%d + %d/%d' % (p, a, q, b)
-    answer = '\n'.join([
+    steps = [
         'Step 1: Find the least common denominator of %d and %d, so use %d'
         % (a, b, l),
         'Step 2: Rewrite fractions, so %d/%d + %d/%d'
         % (p * (l // a), l, q * (l // b), l),
-        'Step 3: Add numerators, so %d/%d' % (num, l),
-        'Final answer: %d/%d' % (num, l),
-    ])
-    return problem, answer
+        'Step 3: Add numerators, so %s' % frac(num, l),
+    ]
+    tail, final = reduce_steps(num, l, 4)
+    return problem, '\n'.join(steps + tail + ['Final answer: %s' % final])
 
 
 def divide_fractions(rng):
@@ -140,20 +205,16 @@ def divide_fractions(rng):
     a, b = rng.randint(1, 9), rng.randint(2, 9)
     c, d = rng.randint(1, 9), rng.randint(2, 9)
     num, den = a * d, b * c
-    g = gcd(num, den)
 
     problem = 'Compute %d/%d ÷ %d/%d' % (a, b, c, d)
     steps = [
-        'Step 1: Multiply by its reciprocal, so %d/%d × %d/%d'
-        % (a, b, d, c),
-        'Step 2: Multiply numerators and denominators, so %d/%d'
-        % (num, den),
+        'Step 1: Multiply by its reciprocal, so %d/%d × %s'
+        % (a, b, frac(d, c)),
+        'Step 2: Multiply numerators and denominators, so %s'
+        % frac(num, den),
     ]
-    if g > 1:
-        steps.append('Step 3: Simplify the fraction, so %d/%d'
-                     % (num // g, den // g))
-    steps.append('Final answer: %d/%d' % (num // g, den // g))
-    return problem, '\n'.join(steps)
+    tail, final = reduce_steps(num, den, 3)
+    return problem, '\n'.join(steps + tail + ['Final answer: %s' % final])
 
 
 def signed_integers(rng):
@@ -175,7 +236,7 @@ def quadratic(rng):
     s = rng.randint(-9, 9) or 2
     b, c = r + s, r * s
 
-    problem = 'Solve x^2 %s %s = 0' % (signed(b) + 'x', signed(c))
+    problem = 'Solve x^2 %s %s = 0' % (signed_term(b), signed(c))
     answer = '\n'.join([
         'Step 1: Find two numbers whose product is %d and whose sum is %d, '
         'so use %d and %d' % (c, b, r, s),
@@ -188,14 +249,166 @@ def quadratic(rng):
     return problem, answer
 
 
+def like_terms(rng):
+    '''a*x + c*x + b + d = e, collecting terms before solving'''
+    x = rng.randint(-9, 9)
+    a = rng.randint(2, 9)
+    c = rng.randint(2, 9)
+    b = rng.randint(-9, 9) or 1
+    d = rng.randint(-9, 9) or 2
+    while b + d == 0:
+        d = rng.randint(-9, 9) or 2
+    coeff, k = a + c, b + d
+    e = coeff * x + k
+
+    problem = 'Solve for x: %s %s %s %s = %d' \
+        % (term(a), signed_term(c), signed(b), signed(d), e)
+    answer = '\n'.join([
+        'Step 1: Add %dx and %dx, so %dx %s %s = %d'
+        % (a, c, coeff, signed(b), signed(d), e),
+        'Step 2: Combine constant terms, so %dx %s = %d'
+        % (coeff, signed(k), e),
+        'Step 3: %s' % move_constant(k, coeff, e),
+        'Step 4: Now divide both sides by %d, so x = %d' % (coeff, x),
+        'Final answer: x = %d' % x,
+    ])
+    return problem, answer
+
+
+def both_sides(rng):
+    '''a*x + b = c*x + d, the variable on both sides'''
+    x = rng.randint(-9, 9)
+    c = rng.randint(1, 7)
+    a = c + rng.randint(2, 9)
+    coeff = a - c
+    b = rng.randint(-9, 9) or 3
+    d = coeff * x + b
+    while d == 0:
+        b = rng.randint(-9, 9) or 3
+        d = coeff * x + b
+
+    problem = 'Solve for x: %s %s = %s %s' \
+        % (term(a), signed(b), term(c), signed(d))
+    answer = '\n'.join([
+        'Step 1: Subtract %s from both sides, leaving %s %s = %d'
+        % (term(c), term(coeff), signed(b), d),
+        'Step 2: %s' % move_constant(b, coeff, d),
+        'Step 3: Now divide both sides by %d, so x = %d' % (coeff, x),
+        'Final answer: x = %d' % x,
+    ])
+    return problem, answer
+
+
+def reduce_fraction(rng):
+    '''Cancel the common factor out of g*p / g*q.
+
+    p and q are coprime, so g really is the whole common factor and one
+    cancelling step finishes the job.
+    '''
+    g = rng.randint(2, 9)
+    p, q = 1, 1
+    while gcd(p, q) != 1 or p == q:
+        p, q = rng.randint(1, 9), rng.randint(2, 9)
+
+    problem = 'Simplify %d/%d' % (g * p, g * q)
+    steps, final = reduce_steps(g * p, g * q, 1)
+    return problem, '\n'.join(steps + ['Final answer: %s' % final])
+
+
+def groups_of(rng):
+    '''Multiplication as repeated addition, kept short enough to read'''
+    a = rng.randint(2, 5)
+    b = rng.randint(2, 9)
+
+    problem = 'Compute %d × %d' % (a, b)
+    answer = '\n'.join([
+        'Step 1: %d × %d is the same as %d groups of %d' % (a, b, a, b),
+        'Step 2: Adding %s, so %d' % (' and '.join([str(b)] * a), a * b),
+        'Final answer: %d' % (a * b),
+    ])
+    return problem, answer
+
+
+def subtract_negative(rng):
+    '''a - -b, the sign rule stated explicitly'''
+    a = rng.randint(1, 20)
+    b = rng.randint(1, 20)
+
+    problem = 'Compute %d - -%d' % (a, b)
+    answer = '\n'.join([
+        'Step 1: Subtracting -%d is the same as adding %d' % (b, b),
+        'Step 2: Add %d + %d = %d' % (a, b, a + b),
+        'Final answer: %d' % (a + b),
+    ])
+    return problem, answer
+
+
+def multiply_fractions(rng):
+    '''p/q x r/s, reduced when it needs reducing'''
+    p, q = rng.randint(1, 9), rng.randint(2, 9)
+    r, s = rng.randint(1, 9), rng.randint(2, 9)
+    num, den = p * r, q * s
+
+    problem = 'Compute %d/%d × %d/%d' % (p, q, r, s)
+    steps = ['Step 1: Multiplying numerators and denominators, so %s'
+             % frac(num, den)]
+    tail, final = reduce_steps(num, den, 2)
+    return problem, '\n'.join(steps + tail + ['Final answer: %s' % final])
+
+
+def decimals(rng):
+    '''Decimal addition and subtraction, two places, exact'''
+    a = rng.randint(100, 5000)
+    b = rng.randint(100, 5000)
+
+    if rng.random() < 0.5:
+        problem = 'Compute %s + %s' % (dec(a), dec(b))
+        step = 'Step 1: Add %s + %s = %s' % (dec(a), dec(b), dec(a + b))
+        total = a + b
+    else:
+        a, b = max(a, b), min(a, b)
+        problem = 'Compute %s - %s' % (dec(a), dec(b))
+        step = 'Step 1: Subtract %s from %s, so %s' \
+            % (dec(b), dec(a), dec(a - b))
+        total = a - b
+
+    return problem, '\n'.join([step, 'Final answer: %s' % dec(total)])
+
+
+def difference_of_squares(rng):
+    '''x^2 = r^2, answered as a solution set'''
+    r = rng.randint(2, 12)
+    sq = r * r
+
+    problem = 'Solve x^2 = %d' % sq
+    answer = '\n'.join([
+        'Step 1: Subtract %d from both sides, leaving x^2 - %d = 0'
+        % (sq, sq),
+        'Step 2: Find two numbers whose product is -%d and whose sum is 0, '
+        'so use %d and -%d' % (sq, r, r),
+        'Step 3: Factor the quadratic, so (x + %d)(x - %d) = 0' % (r, r),
+        'Step 4: Use the zero-product property, so solve each equation',
+        'Final answer: x = {%d, -%d}' % (r, r),
+    ])
+    return problem, answer
+
+
 KINDS = {
     'linear': (two_step, 'a*x + b = c, two steps'),
+    'terms': (like_terms, 'collect a*x + c*x and the constant terms first'),
+    'sides': (both_sides, 'a*x + b = c*x + d, variable on both sides'),
     'distribute': (distribute, 'a(x - b) - c = d, four steps'),
     'order': (order_of_ops, 'order of operations on a + b x (c - d)'),
     'fractions': (add_fractions, 'p/a + q/b via a common denominator'),
+    'multiply': (multiply_fractions, 'p/q x r/s, reduced if needed'),
     'divide': (divide_fractions, 'a/b divided by c/d, via the reciprocal'),
+    'reduce': (reduce_fraction, 'cancel the common factor out of a fraction'),
+    'groups': (groups_of, 'multiplication as repeated addition'),
     'signed': (signed_integers, 'signed integer addition, one step'),
+    'negatives': (subtract_negative, 'a - -b, subtracting a negative'),
+    'decimals': (decimals, 'decimal addition and subtraction, two places'),
     'quadratic': (quadratic, 'factor x^2 + bx + c = 0'),
+    'squares': (difference_of_squares, 'x^2 = r^2, answered as a set'),
 }
 
 ALL = sorted(KINDS)
@@ -227,12 +440,20 @@ def build(kinds, n, out_path, seed=0):
     with open(out_path, 'w') as f:
         f.write(text)
 
-    used = len(set(ids))
     print('kinds    %s' % ', '.join(kinds))
     print('wrote    %s' % out_path)
     print('%d exchanges, %d chars, %d tokens (%.2f chars/token)'
           % (len(chunks), len(text), len(ids), len(text) / len(ids)))
-    print('vocab    %d of %d tokens occur' % (used, tok.vocab_size))
+
+    # Which tokens never occur is the useful direction to report: an unused
+    # lexeme is either a problem kind nobody wrote yet or a word the
+    # tokenizer should not be carrying. <pad>/<bos>/<eos>/<unk> are expected
+    # here -- the flat-stream trainer has no use for them.
+    used = set(ids)
+    idle = [t for t in tok.vocab if tok.token_to_id[t] not in used]
+    print('vocab    %d of %d tokens occur' % (len(used), tok.vocab_size))
+    if idle:
+        print('unused   %s' % ' '.join(idle))
     print('\nfirst exchange, as the model sees it:')
     print(tok.compact(chunks[0]))
 
