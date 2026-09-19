@@ -314,11 +314,10 @@ one tap and `×` is a trip through a symbol palette. So multiplication is
 `*`, dividing one fraction by another is parenthesised — `(2/3) / (4/5)` —
 and "about equal" is `~=`.
 
-Generate a corpus and train on it:
+`math_corpus.py` generates the corpus it expects:
 
 ```
 python math_corpus.py list                     # the 22 problem kinds
-python math_corpus.py --n 4000 --out math.txt
 ```
 
 The kinds span one-step arithmetic (signed integers, subtracting a negative,
@@ -335,17 +334,129 @@ the honest to-do list: right now only `<pad>`, `<bos>`, `<eos>` and `<unk>`
 are unused, and those four are unreachable by design because the
 flat-stream trainer has no sequence boundaries to mark.
 
-Then set `'--tokenizer', 'math'` and `'math.txt'` in `tiny_gpt.py`'s
-hardcoded argv block (see [above](#important-how-this-script-takes-its-arguments))
-and run it. Chatting works exactly as before — the tokenizer travels inside
-the checkpoint, so `chat.py` needs no flag:
+### Worked example: training a tiny math GPT
+
+End to end, four steps. The output below is from a real run on a
+laptop-class container with no Accelerate — slower than an iPhone, which
+gets the AMX path.
+
+**1. Generate the corpus.** The seed defaults to 0, so these numbers are
+exactly what you will see:
 
 ```
-python chat.py ask math.npz "Solve for x: 5x + 4 = 19"
+$ python math_corpus.py --n 4000 --out math.txt
+kinds    decimals, derivative, distribute, divide, estimate, factorial, ...
+wrote    math.txt
+4000 exchanges, 702439 chars, 249345 tokens (2.82 chars/token)
+vocab    107 of 111 tokens occur
+unused   <pad> <bos> <eos> <unk>
 ```
+
+**2. Point `tiny_gpt.py` at it.** Command-line flags are discarded, so the
+hardcoded `sys.argv` block *is* the config (see
+[above](#important-how-this-script-takes-its-arguments)):
+
+```python
+    sys.argv = [
+    'tiny_gpt.py',
+    'train',
+    'math.txt',
+    '--steps', '1200',
+    '--B', '16',
+    '--block-size', '96',
+    '--n-layer', '3',
+    '--n-head', '4',
+    '--n-embd', '96',
+    '--rope', '1',
+    '--qk-norm', '1',
+    '--act', 'relu2',
+    '--zero-init', '1',
+    '--value-residual', '1',
+    '--softcap', '30',
+    '--tokenizer', 'math',
+    '--ckpt', 'math.npz',
+    '--lr', '0.003',
+    '--ckpt-every', '200',
+    ]
+```
+
+`--block-size 96` on purpose: exchanges average about 62 tokens, so 96
+covers a whole problem plus a little context. The 256 in the shipped block
+is sized for the alpaca corpus and would be mostly wasted here.
+
+**3. Train.**
+
+```
+$ python tiny_gpt.py
+corpus   math.txt
+tokens   236878 train / 12467 val   vocab 111  (math, 2.82 chars/token)
+model    357026 params  (3 layers, 4 heads, 96 dim, block 96)
+arch     rope=True qk_norm=True act=relu2 zero_init=True value_residual=True softcap=30
+tokens/step 1536   accelerate False   bmm numpy   vForce False
+checkpoint math.npz every 200 steps
+
+step            lr      loss       val   ms/step   elapsed
+0       3.0000e-05    4.7095    4.7085    2154.5      2.2s
+200     2.9453e-03    0.8711    0.9461      89.4     18.0s
+400     2.5341e-03    0.7088    0.6714      83.5     33.5s
+600     1.8421e-03    0.4787    0.5827      81.9     49.2s
+800     1.0892e-03    0.4554    0.5066      80.8     64.7s
+1000    5.1431e-04    0.4408    0.4571      80.5     80.6s
+1199    3.0001e-04    0.3854    0.4330      80.2     96.2s
+```
+
+Check the header before walking away: it should say `(math, 2.82
+chars/token)` and `vocab 111`. If it says `char`, step 2 didn't take.
+
+**4. Chat with it.** The tokenizer travels inside the checkpoint, so
+`chat.py` needs no flag:
+
+```
+$ python chat.py info math.npz
+357,026 params, 3 layers, 4 heads, 96 dim, block_size 96
+vocab 111 (math tokenizer), trained 1200 steps
+val loss 0.4330  (perplexity 1.5, 0.62 bits/token)
+
+$ python chat.py ask math.npz "Solve for x: 5x + 4 = 19" --temp 0.2
+A: <step>1:<subtract>4<from><both_sides>,<so>5x=15<nl>
+   <step>2:<divide><both_sides><by>5,<so>x=3<nl>
+   <final_answer>:x=3
+
+$ python chat.py ask math.npz "Compute 5!" --temp 0.2
+A: <step>1:5<factorial><is><the><same_as>5*4*3*2*1<nl>
+   <step>2:<multiply>5*4=20<nl><step>3:<multiply>20*3=60<nl>
+   <step>4:<multiply>60*2=120<nl><step>5:<multiply>120*1=120<nl>
+   <final_answer>:120
+```
+
+Both of those are right, and it is worth knowing they are not
+representative. The same checkpoint answers `Compute 4 * 7` with `21` and
+`Compute 2/3 + 1/4` with `12/12`. Ninety-six seconds of training buys the
+scaffolding, not the arithmetic — see the last bullet below.
 
 ![A token-level math model answering in chat.py](images/math-tokenizer-chat.png)
 *Figure 5 — the math model's reply, shown in the tokenizer's compact form: one id per lexeme, no spaces.*
+
+**Scaling up.** Generation is free here, which changes the sizing calculus
+versus `direct_corpus.py`: there the corpus is capped by the dataset, here
+another zero costs nothing. `--n 4000` is ~250k tokens, which at 4096
+tokens/step for 3000 steps would be ~49 epochs of the same problems. Prefer
+`--n 20000` (~1.25M tokens, ~10 epochs) with `--B 32 --block-size 128
+--n-layer 4 --n-embd 128 --lr 0.002 --steps 3000`. Expect roughly half an
+hour off-device at that size, considerably less on Apple silicon. Add
+`'--resume', 'math.npz'` to continue a run — the cosine schedule picks up
+where it stopped instead of re-warming.
+
+**A clean eval set** is one command, since the problems are randomly
+generated:
+
+```
+python math_corpus.py --n 2000 --seed 99 --out heldout.txt
+python chat.py eval math.npz heldout.txt
+```
+
+Different problems from the same templates, which is worth more than the
+built-in 5% tail split when comparing two checkpoints.
 
 Three things are worth noticing when you run this:
 
@@ -367,22 +478,6 @@ Three things are worth noticing when you run this:
   the answer table is small — `3!` and `4!` come out right — but that is
   recall, not a rule: the same checkpoint gets `d/dx 9x^5` half right
   (`45x^3`, correct coefficient, wrong exponent) and `d/dx 2x^4` wrong.
-
-#### Example math session (placeholder)
-
-<!-- TODO: replace with real output from a trained math checkpoint -->
-
-```
-$ python chat.py info math.npz
-352,418 params, 3 layers, 4 heads, 96 dim, block_size 96
-vocab 111 (math tokenizer), trained 3600 steps
-val loss 0.2104  (perplexity 1.2, 0.30 bits/token)
-
-$ python chat.py ask math.npz "Solve for x: 5x + 4 = 19" --temp 0.3
-A: <step>1:<subtract>4<from><both_sides>,<so>5x=15<nl>
-   <step>2:<divide><both_sides><by>5,<so>x=3<nl>
-   <final_answer>:x=3
-```
 
 Out-of-language input is refused rather than mangled, because a fixed
 vocabulary has no honest way to represent it:

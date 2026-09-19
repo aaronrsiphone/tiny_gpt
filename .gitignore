@@ -3,3 +3,5 @@ __pycache__/
 *.npz
 corpus.txt
 big.txt
+math.txt
+heldout.txt
