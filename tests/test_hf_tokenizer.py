@@ -6,7 +6,6 @@ always available. The SmolLM2 tests run when the model is cached
 (python hf_run.py download, or import of the zip).
 '''
 
-import os
 import unittest
 
 from tests.hf_common import fixture, smollm2_dir
@@ -85,12 +84,11 @@ class SmolLM2TokenizerTest(unittest.TestCase):
         check_against(self, self.tok, self.d['texts'], self.d['ids'])
 
     def test_readme(self):
-        path = os.path.join(os.path.dirname(__file__), '..', 'README.md')
-        with open(path, 'rb') as f:
-            text = f.read().decode('utf-8')
+        # A long real document (a snapshot of README.md stored in the
+        # fixture, so later README edits cannot make this test skip).
+        text = self.d['readme_text']
         ids = self.tok.encode(text)
-        if ids != self.d['readme_ids']:
-            self.skipTest('README.md changed since the fixture was made')
+        self.assertEqual(ids, self.d['readme_ids'])
         self.assertEqual(self.tok.decode(ids), text)
 
     def test_special_ids(self):

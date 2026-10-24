@@ -624,10 +624,10 @@ SmolLM2-135M-Instruct, 51-token prompt, greedy decoding.
 
 iPhone, Pythonista (Python 3.10, NumPy 1.22, Accelerate):
 
-| weights | load | first token | decode |
-|---------|------|-------------|--------|
-| float32 | 3.5 s  | 0.066 s | ~79 tok/s (12.6 ms/token) |
-| lowmem  | 0.02 s | 0.075 s (0.85 s cold) | ~53 tok/s (18.6 ms/token) |
+| weights | load | first token | decode | footprint (Pythonista alone ~90-120 MB) |
+|---------|------|-------------|--------|-----------------------------------------|
+| float32 | 3.6 s  | 0.07 s | ~78 tok/s (12.8 ms/token) | 727 MB after load, 661 MB generating |
+| lowmem  | 0.01 s | 0.075 s (0.6-0.85 s cold) | ~52 tok/s (19.3 ms/token) | 119 MB after load, 133 MB generating |
 
 On iOS, Accelerate wins every product by 20-180x over Pythonista's
 BLAS-less NumPy; `cblas_sgemv` and a one-row `cblas_sgemm` tie.

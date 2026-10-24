@@ -193,6 +193,7 @@ def smollm2_tokens(model_dir):
     at = AutoTokenizer.from_pretrained(model_dir)
     dump('smollm2_tokens.json', {
         'texts': texts, 'ids': [ref.encode(t).ids for t in texts],
+        'readme_text': readme,
         'readme_ids': ref.encode(readme).ids,
         'chats': chats,
         'chat_text': [at.apply_chat_template(c, tokenize=False,
