@@ -24,6 +24,8 @@ changed) on its own:
     train.py          The training loop
     diagnostics.py    gradcheck, gradcheck_all, bench, profile
     cli.py            Argument parsing and mode dispatch
+    hf/               Pretrained Hugging Face model inference (hf_run.py);
+                      not imported here, so training gains no dependency
 
 Suggested reading order for a newcomer: model.py first, to see the GPT
 itself; then diagnostics.py's gradcheck(), to see how every gradient in
