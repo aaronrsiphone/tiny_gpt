@@ -248,9 +248,13 @@ def load(s, quiet=False):
     t_load = time.time() - t0
     tok = BPETokenizer.from_dir(path)
     try:
-        chat = ChatFormat(tok.chat_template)
-    except ValueError:
+        chat = ChatFormat(tok.chat_template, tok.special_tokens)
+    except ValueError as e:
         chat = None
+        chat_note = str(e)
+    else:
+        chat_note = {'jinja2': "the model's template (jinja2)",
+                     'chatml': 'built-in ChatML (no jinja2)'}[chat.engine]
     stops = set(cfg.eos_ids)
     gen_cfg = os.path.join(path, 'generation_config.json')
     if os.path.exists(gen_cfg):
@@ -264,6 +268,7 @@ def load(s, quiet=False):
         pk = peak_rss_mb()
         print('loaded in %.1fs, memory now %s (peak so far %s MB)'
               % (t_load, memory_line(), '%.0f' % pk if pk else '?'))
+        print('chat format: %s' % chat_note)
     return model, tok, chat, stops, t_load
 
 
@@ -381,7 +386,12 @@ def mode_chat(s):
             print('(cleared)')
             continue
         history.append({'role': 'user', 'content': line})
-        ids, history = fit_history(model, tok, chat, s, history)
+        try:
+            ids, history = fit_history(model, tok, chat, s, history)
+        except ValueError as e:      # the template rejected the messages
+            print(e)
+            history.pop()
+            continue
         sys.stdout.write('\nbot> ')
         out, _ = run_generation(model, tok, cache, ids, s, stops, sampler)
         history.append({'role': 'assistant',

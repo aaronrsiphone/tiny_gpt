@@ -21,6 +21,9 @@ nor the *.npz/*.safetensors patterns this repo ignores or LFS-tracks:
                       reference encodings
   smollm2_tokens.json SmolLM2 encodings and chat-template renderings
   smollm2_logits.json SmolLM2 float32 reference logits / greedy decode
+  chat_templates.json real chat templates from several model repos,
+                      rendered by transformers' own renderer (fetches the
+                      templates from the Hub; skipped when offline)
 '''
 
 import base64
@@ -230,6 +233,75 @@ def smollm2_logits(model_dir):
     })
 
 
+TEMPLATE_REPOS = ['HuggingFaceTB/SmolLM2-135M-Instruct',
+                  'Qwen/Qwen2.5-0.5B-Instruct', 'Qwen/Qwen3-0.6B',
+                  'HuggingFaceTB/SmolLM3-3B',
+                  'microsoft/Phi-3.5-mini-instruct']
+FIXED_NOW = (2026, 1, 15, 9, 30)       # templates that print today's date
+
+
+def chat_templates():
+    import datetime
+    from huggingface_hub import hf_hub_download
+    import transformers.utils.chat_template_utils as ctu
+
+    class FixedClock(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.datetime(*FIXED_NOW)
+    ctu.datetime = FixedClock
+
+    def text(v):
+        return v.get('content') if isinstance(v, dict) else v
+
+    convs = [
+        ([{'role': 'user', 'content': 'What is 2+2?'}], {}),
+        ([{'role': 'system', 'content': 'Answer in French.'},
+          {'role': 'user', 'content': 'Hello!'}], {}),
+        ([{'role': 'user', 'content': 'Name a colour.'},
+          {'role': 'assistant', 'content': 'Blue.'},
+          {'role': 'user', 'content': 'Another, with an emoji \U0001F308'}],
+         {}),
+        ([{'role': 'user', 'content': 'Think briefly: 3*7?'}],
+         {'enable_thinking': False}),
+    ]
+    out = {}
+    for repo in TEMPLATE_REPOS:
+        try:
+            cfg_path = hf_hub_download(repo, 'tokenizer_config.json')
+        except Exception as e:
+            print('skipping chat templates (%s)' % e.__class__.__name__)
+            return
+        with open(cfg_path, 'rb') as f:
+            cfg = json.loads(f.read().decode('utf-8'))
+        tpl = cfg.get('chat_template')
+        try:
+            with open(hf_hub_download(repo, 'chat_template.jinja'),
+                      'rb') as f:
+                tpl = f.read().decode('utf-8')
+        except Exception:
+            pass
+        if isinstance(tpl, list):
+            tpl = dict((t['name'], t['template']) for t in tpl)['default']
+        special = {k: text(cfg[k]) for k in ('bos_token', 'eos_token',
+                                              'unk_token', 'pad_token')
+                   if text(cfg.get(k))}
+        if cfg.get('additional_special_tokens'):
+            special['additional_special_tokens'] = [
+                text(t) for t in cfg['additional_special_tokens']]
+        cases = []
+        for msgs, kw in convs:
+            for agp in (True, False):
+                r, _ = ctu.render_jinja_template(
+                    [msgs], chat_template=tpl, add_generation_prompt=agp,
+                    **dict(special, **kw))
+                cases.append({'messages': msgs, 'kwargs': kw,
+                              'add_generation_prompt': agp, 'text': r[0]})
+        out[repo] = {'template': tpl, 'special_tokens': special,
+                     'cases': cases}
+    dump('chat_templates.json', {'now': list(FIXED_NOW), 'repos': out})
+
+
 def main():
     os.makedirs(FIX, exist_ok=True)
     safetensors_dtypes()
@@ -252,6 +324,7 @@ def main():
                dict(base, tie_word_embeddings=True, num_key_value_heads=6,
                     rope_theta=10000.0), 'F32', seed=3, seq_len=70)
     bpe_tiny()
+    chat_templates()
     if len(sys.argv) > 1:
         smollm2_tokens(sys.argv[1])
         smollm2_logits(sys.argv[1])

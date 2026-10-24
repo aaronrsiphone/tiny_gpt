@@ -10,7 +10,7 @@ then plain HTTPS downloads with `requests`.
     path = find_local('HuggingFaceTB/SmolLM2-135M-Instruct')   # offline
 
 What is downloaded is an allowlist: config.json, generation_config.json,
-the tokenizer files, and safetensors weights (one file, or shards named
+the tokenizer files and chat template, and safetensors weights (one file, or shards named
 by model.safetensors.index.json). Nothing executable is fetched, and a
 repo that only offers pickled PyTorch weights (*.bin, *.pt) is refused
 rather than loaded: unpickling runs arbitrary code.
@@ -44,7 +44,7 @@ ENDPOINT = os.environ.get('HF_ENDPOINT', 'https://huggingface.co')
 
 REQUIRED = ('config.json', 'tokenizer.json')
 OPTIONAL = ('generation_config.json', 'tokenizer_config.json',
-            'special_tokens_map.json')
+            'special_tokens_map.json', 'chat_template.jinja')
 SINGLE = 'model.safetensors'
 INDEX = 'model.safetensors.index.json'
 SHARD_RE = re.compile(r'^model-\d{5}-of-\d{5}\.safetensors$')

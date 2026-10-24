@@ -557,7 +557,7 @@ The capital of France is Paris.
 |------|----------|
 | `hub.py` | Downloader using `requests` + stdlib. One call to the Hub's revision API, then streamed downloads with progress, HTTP Range resume, retries, and SHA-256 (LFS) / git SHA-1 checks. A snapshot cache works offline. Only an allowlist of files is fetched (config, tokenizer, safetensors). Paths are validated, and repos offering only pickled `*.bin`/`*.pt` weights are refused. |
 | `safetensors.py` | Pure-Python reader (struct + json + mmap). Tensors are zero-copy views onto the mapped file. Every offset, length, shape and dtype is validated before bytes are read. Handles F32, F16 and BF16 (an exact 16-bit shift), plus sharded checkpoints through `model.safetensors.index.json`. |
-| `tokenizer.py` | Byte-level BPE from `tokenizer.json`: added/special tokens, the Digits + GPT-2-regex pre-tokenizer, and the same priority-queue merge order as the Rust library. Includes a streaming UTF-8 decoder and ChatML formatting. Configurations it doesn't implement exactly are refused at load. |
+| `tokenizer.py` | Byte-level BPE from `tokenizer.json`: added/special tokens, the Digits + GPT-2-regex pre-tokenizer, and the same priority-queue merge order as the Rust library. Includes a streaming UTF-8 decoder and the chat template, rendered in Jinja2's sandbox exactly as transformers does it. Configurations it doesn't implement exactly are refused at load. |
 | `unicode_tables.py` | `\p{L}`, `\p{N}`, `\s` and Rust `is_numeric` as codepoint ranges, measured from the reference `tokenizers` library (`tools/gen_unicode_tables.py`). This keeps tokenization from drifting with Pythonista's older Unicode database. |
 | `llama.py` | The model: RMSNorm, rotate-half RoPE (including `linear`/`llama3` scaling), grouped-query attention, a preallocated KV cache, SwiGLU, and tied or untied heads. All dimensions come from `config.json`, in either the transformers 4 or 5 layout. Prompts are prefilled with matrix-matrix products and decoding uses matrix-vector products. Also contains the sampler (greedy, temperature, top-k, top-p, repetition penalty). |
 
@@ -593,8 +593,13 @@ against fixtures produced by the official libraries
 
 - **Tokenizer**: ids identical to `tokenizers` on 500+ texts (multilingual,
   emoji/ZWJ, digits, odd whitespace, special tokens, random Unicode) and on
-  all of this README. Chat-template text and ids match
+  a snapshot of this README. Chat-template text and ids match
   `apply_chat_template` exactly.
+- **Chat templates**: the real templates of SmolLM2, SmolLM3, Qwen2.5,
+  Qwen3 and Phi-3.5 render byte-for-byte like transformers' renderer, over
+  40 cases. These include `enable_thinking=False`, a dated system prompt
+  and `{% generation %}`. Templates can't escape the sandbox, and
+  `raise_exception` surfaces as a clear error.
 - **Model**: three tiny random Llamas (GQA and MHA; biases; untied head;
   llama3 RoPE scaling; BF16/F16/F32) match `transformers` float32 logits to
   ~4e-5 in both weight modes. This holds for prefill at several chunk sizes
@@ -653,8 +658,9 @@ Pythonista, because its interpreter stays alive between runs.
   `pretraining_tp`). Others fail with a clear `unsupported model` error,
   as do tokenizers that aren't byte-level BPE (SentencePiece, normalizers,
   byte fallback).
-- The chat formatter understands ChatML templates (SmolLM2's). It doesn't
-  run arbitrary Jinja.
+- Chat templates are rendered with jinja2 (Pythonista ships it). Without
+  jinja2, only plain ChatML templates like SmolLM2's work, and others are
+  refused. Tool definitions (`tools=`) aren't passed to templates yet.
 - Float32 compute throughout. Weights stay BF16 only in `lowmem` mode, and
   there's no int8/4-bit quantization.
 - The context is a hard limit (`CONTEXT_LIMIT`, default 1024). Generation

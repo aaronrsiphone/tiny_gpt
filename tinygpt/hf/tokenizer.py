@@ -201,14 +201,30 @@ class BPETokenizer(object):
             self._added_re = None
         self._cache = {}
 
-        def tid(key):
-            v = config.get(key)
-            if isinstance(v, dict):
-                v = v.get('content')
-            return self.token_to_id.get(v) if v else None
-        self.bos_id = tid('bos_token')
-        self.eos_id = tid('eos_token')
-        self.chat_template = config.get('chat_template')
+        def text(v):
+            return v.get('content') if isinstance(v, dict) else v
+
+        # The special tokens by role, as strings: chat templates refer to
+        # them as variables ({{ bos_token }}), just as transformers passes
+        # its special_tokens_map into the template.
+        self.special_tokens = {}
+        for key in ('bos_token', 'eos_token', 'unk_token', 'pad_token'):
+            if text(config.get(key)):
+                self.special_tokens[key] = text(config[key])
+        extra = config.get('additional_special_tokens')
+        if extra:
+            self.special_tokens['additional_special_tokens'] = [
+                text(t) for t in extra]
+        self.bos_id = self.token_to_id.get(self.special_tokens.get(
+            'bos_token'))
+        self.eos_id = self.token_to_id.get(self.special_tokens.get(
+            'eos_token'))
+        tpl = config.get('chat_template')
+        if isinstance(tpl, list):
+            # Several named templates (e.g. 'default', 'tool_use').
+            named = dict((t.get('name'), t.get('template')) for t in tpl)
+            tpl = named.get('default')
+        self.chat_template = tpl
 
     @classmethod
     def from_dir(cls, path):
@@ -219,6 +235,12 @@ class BPETokenizer(object):
         if os.path.exists(p):
             with open(p, 'rb') as f:
                 cfg = json.loads(f.read().decode('utf-8'))
+        # Newer repos keep the template in its own file, which then wins
+        # over any copy in tokenizer_config.json (as in transformers).
+        p = os.path.join(path, 'chat_template.jinja')
+        if os.path.exists(p):
+            with open(p, 'rb') as f:
+                cfg['chat_template'] = f.read().decode('utf-8')
         return cls(spec, cfg)
 
     # -- encoding ---------------------------------------------------------
@@ -353,25 +375,144 @@ class _Stream(object):
 
 # ----------------------------------------------------------- chat format
 
-class ChatFormat(object):
-    '''ChatML message formatting, as SmolLM2's chat template renders it.
+def _compile_template(template, now):
+    '''Compile a chat template exactly as transformers does.
 
-    Running an arbitrary Jinja template is out of scope, so this
-    recognises the ChatML shape (<|im_start|>role\\ncontent<|im_end|>\\n)
-    and lifts the default system prompt out of the template text. The
-    rendered string is then tokenized like any other text, which is what
-    transformers' apply_chat_template(tokenize=True) does too.
+    Same sandbox (ImmutableSandboxedEnvironment: templates cannot reach
+    files, modules or object internals), same whitespace options, same
+    extras: loopcontrols, the {% generation %} tag, a tojson that does
+    not HTML-escape, raise_exception() and strftime_now().
+    '''
+    import jinja2
+    from jinja2 import nodes
+    from jinja2.ext import Extension, loopcontrols
+    from jinja2.sandbox import ImmutableSandboxedEnvironment
+
+    class GenerationTag(Extension):
+        # transformers uses {% generation %} to find assistant text for
+        # training masks. For rendering it is transparent.
+        tags = set(['generation'])
+
+        def parse(self, parser):
+            lineno = next(parser.stream).lineno
+            body = parser.parse_statements(['name:endgeneration'],
+                                           drop_needle=True)
+            return nodes.CallBlock(self.call_method('_body'), [], [],
+                                   body).set_lineno(lineno)
+
+        def _body(self, caller):
+            return caller()
+
+    def raise_exception(message):
+        raise jinja2.exceptions.TemplateError(message)
+
+    def tojson(x, ensure_ascii=False, indent=None, separators=None,
+               sort_keys=False):
+        return json.dumps(x, ensure_ascii=ensure_ascii, indent=indent,
+                          separators=separators, sort_keys=sort_keys)
+
+    env = ImmutableSandboxedEnvironment(
+        trim_blocks=True, lstrip_blocks=True,
+        extensions=[GenerationTag, loopcontrols])
+    env.filters['tojson'] = tojson
+    env.globals['raise_exception'] = raise_exception
+    env.globals['strftime_now'] = lambda fmt: now().strftime(fmt)
+    return env.from_string(template), jinja2.exceptions.TemplateError
+
+
+# Without jinja2, only these exact templates are rendered, by hand. {SYSTEM}
+# stands for a default system prompt. Anything else is refused rather
+# than approximated.
+_KNOWN_CHATML = (
+    # SmolLM2
+    "{% for message in messages %}{% if loop.first and messages[0]['role']"
+    " != 'system' %}{{ '<|im_start|>system\n{SYSTEM}<|im_end|>\n' }}"
+    "{% endif %}{{'<|im_start|>' + message['role'] + '\n' + "
+    "message['content'] + '<|im_end|>' + '\n'}}{% endfor %}"
+    "{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}"
+    "{% endif %}",
+    # plain ChatML, no default system prompt
+    "{% for message in messages %}{{'<|im_start|>' + message['role'] + "
+    "'\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}"
+    "{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}"
+    "{% endif %}",
+)
+
+
+def _match_known(template):
+    '''(True, default system prompt or None) if template is one of
+    _KNOWN_CHATML, else (False, None).'''
+    for known in _KNOWN_CHATML:
+        if '{SYSTEM}' not in known:
+            if template == known:
+                return True, None
+            continue
+        head, tail = known.split('{SYSTEM}')
+        if (template.startswith(head) and template.endswith(tail)
+                and len(template) >= len(head) + len(tail)):
+            system = template[len(head):len(template) - len(tail)]
+            if "'" not in system and '{' not in system:
+                return True, system
+    return False, None
+
+
+class ChatFormat(object):
+    '''Turns a list of {'role', 'content'} messages into prompt text
+    using the model's own chat template.
+
+    With jinja2 (Pythonista ships it) the template itself is rendered,
+    in the same sandbox and with the same variables as transformers'
+    apply_chat_template: messages, add_generation_prompt, tools=None,
+    documents=None, the special tokens by name, plus any extra keyword
+    arguments the template reads (e.g. enable_thinking=False).
+
+    Without jinja2, a known plain ChatML template (SmolLM2's) is rendered
+    by hand, and any other template is refused.
+
+    The rendered string is tokenized like any other text, which is what
+    apply_chat_template(tokenize=True) does too.
     '''
 
-    def __init__(self, template):
-        if not template or '<|im_start|>' not in template:
+    def __init__(self, template, special_tokens=None, use_jinja=None,
+                 now=None):
+        if not template:
+            raise UnsupportedTokenizer('model has no chat template; use '
+                                       'completion mode')
+        import datetime
+        self.template = template
+        self.special_tokens = dict(special_tokens or {})
+        self.now = now or datetime.datetime.now
+        self._jinja = None
+        if use_jinja is not False:
+            try:
+                self._jinja, self._TemplateError = _compile_template(
+                    template, self.now)
+            except ImportError:
+                if use_jinja:
+                    raise
+        if self._jinja is not None:
+            self.engine = 'jinja2'
+            return
+        ok, self.default_system = _match_known(template)
+        if not ok:
             raise UnsupportedTokenizer(
-                'chat template is not ChatML; use completion mode')
-        m = re.search(r"'<\|im_start\|>system\n(.*?)<\|im_end\|>\n'",
-                      template, re.S)
-        self.default_system = m.group(1) if m else None
+                'rendering this chat template needs jinja2 (pip install '
+                'jinja2); use completion mode')
+        self.engine = 'chatml'
 
-    def render(self, messages, add_generation_prompt=True):
+    def render(self, messages, add_generation_prompt=True, **kwargs):
+        if self._jinja is not None:
+            ctx = dict(self.special_tokens)
+            ctx.update(kwargs)
+            try:
+                return self._jinja.render(
+                    messages=messages, tools=None, documents=None,
+                    add_generation_prompt=add_generation_prompt, **ctx)
+            except self._TemplateError as e:
+                raise ValueError('chat template: %s' % e)
+        if kwargs:
+            raise ValueError('template options %s need jinja2'
+                             % ', '.join(sorted(kwargs)))
         out = []
         if (self.default_system is not None and messages
                 and messages[0]['role'] != 'system'):
