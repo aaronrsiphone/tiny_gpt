@@ -573,11 +573,12 @@ Design points:
   checked against NumPy before it may win. `bench` prints the table.
   `TINY_GPT_MATVEC` / `TINY_GPT_MATMUL` force a choice for A/B runs.
   `backend.py` gained a `gemv()` wrapper; `gemm()` is unchanged.
-- **Two weight modes.** `float32` widens everything once at load (~540 MB
-  for SmolLM2-135M; the BF16 file pages are released afterwards). `lowmem`
+- **Two weight modes.** `float32` reads each tensor with a plain file read
+  (no memory map, so no BF16 pages stay mapped into the process) and widens
+  everything once at load (~540 MB for SmolLM2-135M). `lowmem`
   leaves the weights in the memory-mapped file in their stored dtype and
   widens a slab at a time into an 8 MB scratch buffer. That keeps resident
-  weight memory to the OS's clean, droppable file cache, at roughly 4-5x
+  weight memory to the OS's clean, droppable file cache, at roughly 1.5x (iPhone) to 4-5x (Linux)
   slower decoding.
 - **Chat reuses the KV cache.** Each turn re-renders the conversation, and
   only the tokens after the longest cached prefix are computed. When the
@@ -619,18 +620,32 @@ The SmolLM2 tests skip unless the model is cached.
 
 ### Performance
 
-Measured on a 4-vCPU Linux container (NumPy + OpenBLAS, no Accelerate),
-SmolLM2-135M-Instruct, 51-token prompt, greedy:
+SmolLM2-135M-Instruct, 51-token prompt, greedy decoding.
+
+iPhone, Pythonista (Python 3.10, NumPy 1.22, Accelerate):
+
+| weights | load | first token | decode |
+|---------|------|-------------|--------|
+| float32 | 3.5 s  | 0.066 s | ~79 tok/s (12.6 ms/token) |
+| lowmem  | 0.02 s | 0.075 s (0.85 s cold) | ~53 tok/s (18.6 ms/token) |
+
+On iOS, Accelerate wins every product by 20-180x over Pythonista's
+BLAS-less NumPy; `cblas_sgemv` and a one-row `cblas_sgemm` tie.
+
+4-vCPU Linux container (NumPy + OpenBLAS, no Accelerate):
 
 | weights | load | first token | decode | peak RSS |
 |---------|------|-------------|--------|----------|
-| float32 | 2.4 s | 0.15 s | ~40 tok/s | 714-778 MB |
+| float32 | 2.4 s | 0.15 s | ~40 tok/s | ~730 MB |
 | lowmem  | 0 s   | 0.29 s | ~8.5 tok/s | ~400 MB (mostly clean file cache) |
 
 Decoding is memory-bandwidth bound: profiling shows ~70% of each token in
 the matrix-vector products, which stream all 540 MB of float32 weights.
-iPhone numbers come from `python hf_run.py selftest`, which writes
-`hf_report.txt`.
+`python hf_run.py selftest` produces these numbers on any device and writes
+them to `hf_report.txt`. Its memory line reports usage before and after
+load and after generating. On iOS/macOS that figure is `phys_footprint`,
+which the OS memory limit uses. Peak RSS also lasts across runs in
+Pythonista, because its interpreter stays alive between runs.
 
 ### Limitations
 

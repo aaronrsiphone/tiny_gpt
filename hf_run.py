@@ -113,6 +113,85 @@ def peak_rss_mb():
     return r / 1e6 if sys.platform in ('darwin', 'ios') else r / 1e3
 
 
+def _task_vm_info():
+    '''Mach task_vm_info for this process (macOS / iOS), or None.
+
+    phys_footprint is the number iOS compares against an app's memory
+    limit: dirty and compressed memory, but not clean file pages the OS
+    can drop and re-read. Unlike ru_maxrss it reports *now*, so it means
+    something even inside Pythonista, whose interpreter outlives a run.
+    '''
+    import ctypes
+    u64 = ctypes.c_uint64
+
+    class TaskVMInfo(ctypes.Structure):
+        _fields_ = ([('virtual_size', u64), ('region_count', ctypes.c_int32),
+                     ('page_size', ctypes.c_int32)]
+                    + [(n, u64) for n in (
+                        'resident_size', 'resident_size_peak', 'device',
+                        'device_peak', 'internal', 'internal_peak',
+                        'external', 'external_peak', 'reusable',
+                        'reusable_peak', 'purgeable_volatile_pmap',
+                        'purgeable_volatile_resident',
+                        'purgeable_volatile_virtual', 'compressed',
+                        'compressed_peak', 'compressed_lifetime',
+                        'phys_footprint', 'min_address', 'max_address')]
+                    + [('ledger_phys_footprint_peak', ctypes.c_int64)])
+
+    try:
+        lib = ctypes.CDLL('/usr/lib/libSystem.B.dylib')
+        task = ctypes.c_uint32.in_dll(lib, 'mach_task_self_')
+        task_info = lib.task_info
+    except (OSError, ValueError, AttributeError):
+        return None
+    task_info.restype = ctypes.c_int
+    task_info.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_void_p,
+                          ctypes.POINTER(ctypes.c_uint32)]
+    info = TaskVMInfo()
+    count = ctypes.c_uint32(ctypes.sizeof(info) // 4)
+    TASK_VM_INFO = 22
+    if task_info(task.value, TASK_VM_INFO, ctypes.byref(info),
+                 ctypes.byref(count)) != 0:
+        return None
+    # The kernel fills as many fields as it supports and says how many in
+    # `count` (in 4-byte units); fields past that were not written.
+    have = count.value * 4
+    out = {'resident': info.resident_size}
+    if have >= TaskVMInfo.min_address.offset:
+        out['footprint'] = info.phys_footprint
+    if have >= TaskVMInfo.ledger_phys_footprint_peak.offset + 8:
+        out['footprint_peak'] = info.ledger_phys_footprint_peak
+    return out
+
+
+def memory_now():
+    '''(MB, what it measures) for this process right now, or (None, '').
+
+    iOS/macOS: phys_footprint, the figure the OS memory limit uses.
+    Linux: resident set size from /proc.
+    '''
+    if sys.platform in ('darwin', 'ios'):
+        info = _task_vm_info()
+        if info and 'footprint' in info:
+            return info['footprint'] / 1e6, 'footprint'
+        if info:
+            return info['resident'] / 1e6, 'resident'
+        return None, ''
+    try:
+        with open('/proc/self/status') as f:
+            for line in f:
+                if line.startswith('VmRSS:'):
+                    return int(line.split()[1]) / 1e3, 'resident'
+    except (OSError, ValueError):
+        pass
+    return None, ''
+
+
+def memory_line():
+    mb, what = memory_now()
+    return '%.0f MB %s' % (mb, what) if mb is not None else 'n/a'
+
+
 # ------------------------------------------------------------------ model
 
 def locate(s):
@@ -182,8 +261,9 @@ def load(s, quiet=False):
     if tok.eos_id is not None:
         stops.add(tok.eos_id)
     if not quiet:
-        print('loaded in %.1fs, peak memory %s MB'
-              % (t_load, '%.0f' % peak_rss_mb() if peak_rss_mb() else '?'))
+        pk = peak_rss_mb()
+        print('loaded in %.1fs, memory now %s (peak so far %s MB)'
+              % (t_load, memory_line(), '%.0f' % pk if pk else '?'))
     return model, tok, chat, stops, t_load
 
 
@@ -309,10 +389,14 @@ def mode_chat(s):
 
 
 def bench(s, out=print):
-    '''Load time, first-token latency, decode speed, peak memory.'''
+    '''Load time, first-token latency, decode speed, memory.'''
+    import gc
     from tinygpt import backend
     from tinygpt.hf.llama import Sampler, generate
+    gc.collect()                    # let an earlier bench's model go first
+    mem0 = memory_line()
     model, tok, chat, stops, t_load = load(s, quiet=True)
+    mem1 = memory_line()
     out('model        %s (%s)' % (s['model'], s['weights']))
     out('platform     %s, python %s, numpy %s'
         % (sys.platform, sys.version.split()[0], __import__('numpy')
@@ -343,6 +427,8 @@ def bench(s, out=print):
         model.step(t, cache)
     out('token-by-token prompt (no prefill): %.3f s' % (time.time() - t0))
     pk = peak_rss_mb()
+    out('memory       before load %s; after load %s; after generating %s'
+        % (mem0, mem1, memory_line()))
     out('peak memory  %s MB (this process so far)'
         % ('%.0f' % pk if pk else 'n/a'))
     out('greedy text  %r' % tok.decode(res, skip_special=True)[:200])

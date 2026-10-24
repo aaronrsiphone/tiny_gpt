@@ -16,8 +16,9 @@ matrix-vector products rather than seven.
 
 Two weight modes:
 
-  'float32'  every matrix widened to float32 once, at load. Fastest; for
-             SmolLM2-135M about 540 MB.
+  'float32'  every matrix read once with plain file reads (no memory
+             map) and widened to float32. Fastest; for SmolLM2-135M about
+             540 MB.
   'lowmem'   matrices stay in the file's own dtype (BF16 for SmolLM2),
              memory-mapped, and are widened a slab at a time into one
              small scratch buffer as each product needs them. Resident
@@ -504,11 +505,7 @@ class LlamaModel(object):
                 b = np.concatenate([vec(n, s[0]) for n, s in
                                     zip(bias_names, [s for _, s in
                                                      names_shapes])])
-            out = Linear(parts, weights, self.mv, scratch, b)
-            if weights == 'float32':
-                for n, _ in names_shapes:
-                    ckpt.drop_pages(n)
-            return out
+            return Linear(parts, weights, self.mv, scratch, b)
 
         qd, kvd, I = cfg.q_dim, cfg.kv_dim, cfg.inter
         self.layers = []
@@ -535,28 +532,25 @@ class LlamaModel(object):
             self.layers.append(L)
         self.norm = vec('model.norm.weight', H)
 
-        emb_raw = raw('model.embed_tokens.weight', (cfg.vocab, H))
         if cfg.tied or 'lm_head.weight' not in ckpt:
             if not cfg.tied:
                 raise UnsupportedModel('untied model has no lm_head.weight')
             self.head = lin([('model.embed_tokens.weight', (cfg.vocab, H))])
         else:
             self.head = lin([('lm_head.weight', (cfg.vocab, H))])
-        if weights == 'float32' and cfg.tied:
-            self._emb = self.head.W        # one copy serves both
-        elif weights == 'float32':
-            self._emb = to_f32(*emb_raw)
+        emb_shape = (cfg.vocab, H)
+        if weights == 'float32':
+            self._emb_raw = None
+            self._emb = self.head.W if cfg.tied else \
+                to_f32(*raw('model.embed_tokens.weight', emb_shape))
         else:
             self._emb = None
-        self._emb_raw = emb_raw
+            self._emb_raw = raw('model.embed_tokens.weight', emb_shape)
 
         self.cos, self.sin = rope_tables(cfg, self.ctx_limit)
         self.scale = np.float32(1.0 / math.sqrt(cfg.head_dim))
         if weights == 'float32':
-            # Everything now lives in float32 copies. Dropping the last
-            # views onto the file lets the mapping go, so the BF16 pages
-            # are not held alongside the widened weights.
-            self._emb_raw = None
+            # Everything now lives in the float32 copies.
             self.ckpt = None
             ckpt.close()
 
@@ -567,7 +561,12 @@ class LlamaModel(object):
         import json
         with open(os.path.join(path, 'config.json'), 'rb') as f:
             cfg = LlamaConfig(json.loads(f.read().decode('utf-8')))
-        ckpt = Checkpoint(path)
+        # Only lowmem mode reads weights through a memory map. float32 mode
+        # reads each tensor with an ordinary file read and widens it: the
+        # file's pages then sit in the OS cache, which is not charged to
+        # this process, instead of being mapped into it. On iOS mapped
+        # pages stayed resident and added ~300 MB to the load peak.
+        ckpt = Checkpoint(path, use_mmap=kw.get('weights') == 'lowmem')
         try:
             return cls(cfg, ckpt, **kw)
         except BaseException:

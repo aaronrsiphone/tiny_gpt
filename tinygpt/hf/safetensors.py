@@ -7,10 +7,12 @@ each tensor's dtype, shape and [begin, end) byte range within the data
 section that follows, and then the raw little-endian tensor bytes. There
 is no code in the file and nothing to unpickle, which is the point.
 
-The file is memory-mapped, never read whole: get() returns a NumPy view
-straight onto the mapped bytes, so asking for one tensor touches only that
-tensor's pages, and the OS can drop clean pages again under pressure.
-Everything in the header is validated -- dtype, shape, byte length,
+The file is never read whole. By default it is memory-mapped and get_raw()
+returns a NumPy view straight onto the mapped bytes, so asking for one
+tensor touches only that tensor's pages. With use_mmap=False each tensor
+is instead read into its own array, which is better when every tensor is
+about to be converted and discarded anyway: nothing stays mapped into the
+process afterwards. Everything in the header is validated -- dtype, shape, byte length,
 bounds, overlap -- before any tensor bytes are interpreted.
 
 BF16 has no NumPy dtype. It is exposed as uint16 raw bits, and
@@ -206,27 +208,6 @@ class SafeTensorsFile(object):
         '''The tensor as a new (or the given) float32 array.'''
         return to_f32(self.get_raw(name), self.info(name).dtype, out)
 
-    def drop_pages(self, name):
-        '''Hint that a tensor's mapped pages are no longer needed.
-
-        Purely an optimisation for peak memory while widening weights at
-        load: the pages are clean, so the OS may discard them, and they
-        are simply read again from the file if touched later.
-        '''
-        if self._mm is None or not hasattr(self._mm, 'madvise'):
-            return
-        adv = getattr(mmap, 'MADV_DONTNEED', None)
-        if adv is None:
-            return
-        t = self.info(name)
-        page = mmap.PAGESIZE
-        a = (self.data_start + t.begin) // page * page
-        b = self.data_start + t.end
-        try:
-            self._mm.madvise(adv, a, b - a)
-        except (OSError, ValueError):
-            pass
-
     def close(self):
         # Views handed out by get_raw() keep the map alive; closing it from
         # under them would crash, so just drop our reference.
@@ -294,9 +275,6 @@ class Checkpoint(object):
 
     def get_f32(self, name, out=None):
         return self._file(name).get_f32(name, out)
-
-    def drop_pages(self, name):
-        self._file(name).drop_pages(name)
 
     def close(self):
         for f in self.files.values():
