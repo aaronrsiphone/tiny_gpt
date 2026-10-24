@@ -26,9 +26,15 @@ CblasRowMajor = 101
 CblasNoTrans = 111
 CblasTrans = 112
 
+# TINY_GPT_CBLAS points at any other CBLAS library (e.g. a Linux
+# libblas.so.3) so the ctypes bindings below can be exercised and checked
+# against NumPy on a machine that has no Accelerate.
+_LIB_PATH = os.environ.get(
+    'TINY_GPT_CBLAS',
+    '/System/Library/Frameworks/Accelerate.framework/Accelerate')
+
 try:
-    _lib = ctypes.CDLL(
-        '/System/Library/Frameworks/Accelerate.framework/Accelerate')
+    _lib = ctypes.CDLL(_LIB_PATH)
     _sgemm = _lib.cblas_sgemm
     _sgemm.restype = None
     _sgemm.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_int,
@@ -37,8 +43,25 @@ try:
                        ctypes.c_void_p, ctypes.c_int,
                        ctypes.c_float, ctypes.c_void_p, ctypes.c_int]
     HAVE_ACCELERATE = True
-except OSError:
+except (OSError, AttributeError):
     HAVE_ACCELERATE = False
+
+# cblas_sgemv is bound separately so that a library lacking it cannot take
+# cblas_sgemm down with it. Used by the Hugging Face inference path, where
+# single-token decoding is all matrix-vector products.
+_sgemv = None
+if HAVE_ACCELERATE:
+    try:
+        _sgemv = _lib.cblas_sgemv
+        _sgemv.restype = None
+        _sgemv.argtypes = [ctypes.c_int, ctypes.c_int,
+                           ctypes.c_int, ctypes.c_int,
+                           ctypes.c_float, ctypes.c_void_p, ctypes.c_int,
+                           ctypes.c_void_p, ctypes.c_int,
+                           ctypes.c_float, ctypes.c_void_p, ctypes.c_int]
+    except AttributeError:
+        _sgemv = None
+HAVE_SGEMV = _sgemv is not None
 
 
 DT = np.float32
@@ -142,6 +165,38 @@ def gemm(A, B, C, transA=False, transB=False, beta=0.0):
            M, N, K, 1.0,
            _p(A), A.shape[1], _p(B), B.shape[1],
            beta, _p(C), C.shape[1])
+
+
+def _gemv_ok(A, x, y):
+    return (A.dtype == np.float32 and x.dtype == np.float32
+            and y.dtype == np.float32 and A.ndim == 2
+            and A.flags.c_contiguous and x.flags.c_contiguous
+            and y.flags.c_contiguous)
+
+
+def gemv(A, x, y, trans=False, beta=0.0):
+    '''y = op(A) @ x + beta*y for a row-major float32 matrix, in place.
+
+    A is (M, N). With trans=False x has N entries and y has M; with
+    trans=True it is the other way round. Falls back to NumPy whenever
+    cblas_sgemv is missing or the operands are not contiguous float32,
+    so the result never depends on which path ran.
+    '''
+    M, N = A.shape
+    if not HAVE_SGEMV or not _gemv_ok(A, x, y):
+        a = A.T if trans else A
+        if beta == 0.0:
+            np.dot(a, x, out=y)
+        else:
+            y *= beta
+            y += a @ x
+        return y
+    if x.size != (M if trans else N) or y.size != (N if trans else M):
+        raise ValueError('gemv: shapes %r, x %d, y %d do not agree'
+                         % (A.shape, x.size, y.size))
+    _sgemv(CblasRowMajor, CblasTrans if trans else CblasNoTrans,
+           M, N, 1.0, _p(A), N, _p(x), 1, beta, _p(y), 1)
+    return y
 
 
 # Attention is ~7.6% of arithmetic but ~98% of GEMM call count: thousands

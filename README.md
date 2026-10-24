@@ -32,6 +32,8 @@ Then, if you want to change what a token *is*:
 
 - Python 3
 - `numpy`
+- `requests`, only for downloading Hugging Face models (`hf_run.py
+  download`), and Pythonista ships it
 - Nothing else. On macOS/iOS, `tiny_gpt.py` automatically detects and uses
   the system Accelerate framework for a large speedup; on every other
   platform it silently falls back to NumPy matmuls and produces identical
@@ -55,6 +57,7 @@ history rewrite and a coordinated force-push.
 | `tiny_gpt.py`      | Command-line entry point for training (see [Code layout](#code-layout)) |
 | `tinygpt/`         | The implementation: model, training loop, checkpointing, diagnostics |
 | `chat.py`          | Loads a trained checkpoint and generates, chats, or evaluates it |
+| `hf_run.py`        | Downloads a pretrained Hugging Face model and runs it offline (see [section 5](#5-run-a-pretrained-hugging-face-model)) |
 
 ### Code layout
 
@@ -75,6 +78,7 @@ file:
 | `tinygpt/train.py`       | The training loop |
 | `tinygpt/diagnostics.py` | `gradcheck`, `gradcheck_all`, `bench`, `profile` |
 | `tinygpt/cli.py`         | Argument parsing and mode dispatch |
+| `tinygpt/hf/`            | Pretrained-model inference, separate from the training code: Hub downloader, safetensors reader, byte-level BPE tokenizer, Llama forward pass |
 
 A reasonable reading order: start at `model.py` to see the GPT itself, then
 `diagnostics.py`'s `gradcheck()` to see how every gradient in `model.py` is
@@ -496,6 +500,150 @@ $ python chat.py ask math.npz "why is the sky blue?"
 the math tokenizer has no rule for: whyskblue?
 it only knows the language its corpus is generated in.
 ```
+
+## 5. Run a pretrained Hugging Face model
+
+`hf_run.py` downloads a pretrained Llama-architecture model straight from
+the Hugging Face Hub and runs it entirely on-device, on NumPy and Accelerate.
+There's no inference API, no PyTorch and no `transformers`. The first target
+is [HuggingFaceTB/SmolLM2-135M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct).
+This is inference only. Nothing is trained, and the training code above is
+untouched.
+
+### In Pythonista
+
+1. Open `hf_run.py`, set `MODE = 'download'` and press Run (needs a
+   connection, ~270 MB). The files land in `hf_models/` next to the script.
+   If `SmolLM2-135M-Instruct.zip` from this repo (Git LFS) is already on the
+   device, you can skip the download. Any mode imports the zip automatically
+   when the model isn't cached yet.
+2. Set `MODE = 'chat'` and press Run. From here on nothing touches the
+   network. Turn on airplane mode, quit and reopen Pythonista, and it still
+   works.
+
+The other settings at the top of the file are `PROMPT` (for `'ask'` /
+`'complete'`), `MAX_NEW_TOKENS`, `TEMPERATURE` (0 = greedy), `TOP_K`,
+`TOP_P`, `CONTEXT_LIMIT`, `WEIGHTS` and `SYSTEM_PROMPT`.
+
+### From a shell
+
+```
+python hf_run.py download                       # once, online
+python hf_run.py chat                           # offline from here on
+python hf_run.py ask "Why is the sky blue?" --temp 0
+python hf_run.py complete "Once upon a time" --max-new 100
+python hf_run.py import SmolLM2-135M-Instruct.zip
+python hf_run.py info                           # re-verify cached hashes
+python hf_run.py bench                          # speed + memory -> hf_report.txt
+python hf_run.py selftest                       # tests + bench -> hf_report.txt
+```
+
+```
+$ python hf_run.py ask "What is the capital of France?" --temp 0
+HuggingFaceTB/SmolLM2-135M-Instruct  (134,515,008 params)
+30 layers, hidden 576, 9 heads / 3 kv heads x 64, mlp 1536, vocab 49152, rope theta 100000, tied embeddings
+weights float32, context 1024, needs about 558 MB; Accelerate no (NumPy only)
+loaded in 2.2s, peak memory 778 MB
+
+> What is the capital of France?
+
+The capital of France is Paris.
+[37 prompt tokens in 0.14s, 7 new at 42.5 tok/s]
+```
+
+### What is in `tinygpt/hf/`
+
+| File | Contents |
+|------|----------|
+| `hub.py` | Downloader using `requests` + stdlib. One call to the Hub's revision API, then streamed downloads with progress, HTTP Range resume, retries, and SHA-256 (LFS) / git SHA-1 checks. A snapshot cache works offline. Only an allowlist of files is fetched (config, tokenizer, safetensors). Paths are validated, and repos offering only pickled `*.bin`/`*.pt` weights are refused. |
+| `safetensors.py` | Pure-Python reader (struct + json + mmap). Tensors are zero-copy views onto the mapped file. Every offset, length, shape and dtype is validated before bytes are read. Handles F32, F16 and BF16 (an exact 16-bit shift), plus sharded checkpoints through `model.safetensors.index.json`. |
+| `tokenizer.py` | Byte-level BPE from `tokenizer.json`: added/special tokens, the Digits + GPT-2-regex pre-tokenizer, and the same priority-queue merge order as the Rust library. Includes a streaming UTF-8 decoder and ChatML formatting. Configurations it doesn't implement exactly are refused at load. |
+| `unicode_tables.py` | `\p{L}`, `\p{N}`, `\s` and Rust `is_numeric` as codepoint ranges, measured from the reference `tokenizers` library (`tools/gen_unicode_tables.py`). This keeps tokenization from drifting with Pythonista's older Unicode database. |
+| `llama.py` | The model: RMSNorm, rotate-half RoPE (including `linear`/`llama3` scaling), grouped-query attention, a preallocated KV cache, SwiGLU, and tied or untied heads. All dimensions come from `config.json`, in either the transformers 4 or 5 layout. Prompts are prefilled with matrix-matrix products and decoding uses matrix-vector products. Also contains the sampler (greedy, temperature, top-k, top-p, repetition penalty). |
+
+Design points:
+
+- **No transposed weight copies.** Weights keep Hugging Face's `(out, in)`
+  layout. Decoding is `cblas_sgemv(NoTrans)` and prefill is
+  `cblas_sgemm(transB)`. q/k/v are fused into one matrix per layer, as are
+  gate/up, so a layer costs four matrix-vector products.
+- **Backends are measured, not assumed.** At load, each weight shape is timed
+  with `cblas_sgemv`, a one-row `cblas_sgemm` and NumPy for decoding, and
+  with `cblas_sgemm` and NumPy for prefill. Each candidate's output is
+  checked against NumPy before it may win. `bench` prints the table.
+  `TINY_GPT_MATVEC` / `TINY_GPT_MATMUL` force a choice for A/B runs.
+  `backend.py` gained a `gemv()` wrapper; `gemm()` is unchanged.
+- **Two weight modes.** `float32` widens everything once at load (~540 MB
+  for SmolLM2-135M; the BF16 file pages are released afterwards). `lowmem`
+  leaves the weights in the memory-mapped file in their stored dtype and
+  widens a slab at a time into an 8 MB scratch buffer. That keeps resident
+  weight memory to the OS's clean, droppable file cache, at roughly 4-5x
+  slower decoding.
+- **Chat reuses the KV cache.** Each turn re-renders the conversation, and
+  only the tokens after the longest cached prefix are computed. When the
+  context limit is reached, the oldest exchanges are dropped.
+
+### Verification
+
+`tests/test_hf_*.py` (plain `unittest`, NumPy only) compares everything
+against fixtures produced by the official libraries
+(`tests/make_hf_fixtures.py`, which needs `torch`, `transformers`,
+`tokenizers` and `safetensors` on a desktop):
+
+- **Tokenizer**: ids identical to `tokenizers` on 500+ texts (multilingual,
+  emoji/ZWJ, digits, odd whitespace, special tokens, random Unicode) and on
+  all of this README. Chat-template text and ids match
+  `apply_chat_template` exactly.
+- **Model**: three tiny random Llamas (GQA and MHA; biases; untied head;
+  llama3 RoPE scaling; BF16/F16/F32) match `transformers` float32 logits to
+  ~4e-5 in both weight modes. This holds for prefill at several chunk sizes
+  and for cached single-token decoding, and the cached path agrees with an
+  uncached recompute of every prefix.
+- **SmolLM2-135M-Instruct**: logits match `transformers` float32 to <1e-4
+  at every prompt position, and a 48-token greedy decode is token-for-token
+  identical. Inference runs with sockets disabled to prove it's offline.
+- **safetensors / BF16**: all 65,536 BF16 bit patterns, files written by the
+  `safetensors` library, and a battery of malformed headers.
+- **Downloader**: a fake Hub on localhost covers a dropped connection
+  resumed via Range, corrupted bytes rejected, cache reuse, offline lookup,
+  pickle-only repos refused and zip-import path traversal ignored.
+- **BLAS bindings**: `gemv`/`gemm` against NumPy. On Linux,
+  `TINY_GPT_CBLAS=/usr/lib/x86_64-linux-gnu/libblas.so.3` routes them
+  through a real CBLAS, so the ctypes code is exercised without Accelerate.
+
+```
+python -m unittest discover -s tests -p 'test_hf*.py' -t .
+```
+
+The SmolLM2 tests skip unless the model is cached.
+
+### Performance
+
+Measured on a 4-vCPU Linux container (NumPy + OpenBLAS, no Accelerate),
+SmolLM2-135M-Instruct, 51-token prompt, greedy:
+
+| weights | load | first token | decode | peak RSS |
+|---------|------|-------------|--------|----------|
+| float32 | 2.4 s | 0.15 s | ~40 tok/s | 714-778 MB |
+| lowmem  | 0 s   | 0.29 s | ~8.5 tok/s | ~400 MB (mostly clean file cache) |
+
+Decoding is memory-bandwidth bound: profiling shows ~70% of each token in
+the matrix-vector products, which stream all 540 MB of float32 weights.
+iPhone numbers come from `python hf_run.py selftest`, which writes
+`hf_report.txt`.
+
+### Limitations
+
+- Llama-architecture models only (`LlamaForCausalLM`, SiLU, no
+  `pretraining_tp`). Others fail with a clear `unsupported model` error,
+  as do tokenizers that aren't byte-level BPE (SentencePiece, normalizers,
+  byte fallback).
+- The chat formatter understands ChatML templates (SmolLM2's). It doesn't
+  run arbitrary Jinja.
+- Float32 compute throughout. Weights stay BF16 only in `lowmem` mode, and
+  there's no int8/4-bit quantization.
+- The context is a hard limit (`CONTEXT_LIMIT`, default 1024). Generation
+  stops there rather than sliding, because Llama wasn't trained to slide.
 
 ## License
 
