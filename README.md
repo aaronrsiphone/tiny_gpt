@@ -37,6 +37,15 @@ Then, if you want to change what a token *is*:
   platform it silently falls back to NumPy matmuls and produces identical
   results, just slower.
 
+## Git LFS
+
+Large model archives and weight files are tracked with Git LFS. Install Git
+LFS and run `git lfs install` before cloning or adding these files; after
+cloning, use `git lfs pull` if the LFS objects were not downloaded
+automatically. The existing `SmolLM2-135M-Instruct.zip` is already in Git
+history as a regular Git blob; converting past commits to LFS requires a
+history rewrite and a coordinated force-push.
+
 ## Repository layout
 
 | File               | Purpose                                              |
