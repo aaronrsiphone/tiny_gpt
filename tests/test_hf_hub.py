@@ -229,6 +229,32 @@ class NamesTest(unittest.TestCase):
             with self.assertRaises(hub.HubError):
                 hub.check_repo_id(bad)
 
+    def test_urls(self):
+        want = 'HuggingFaceTB/SmolLM2-360M-Instruct'
+        for text in (want, ' %s ' % want,
+                     'https://huggingface.co/' + want,
+                     'https://huggingface.co/%s/' % want,
+                     'huggingface.co/' + want,
+                     'https://hf.co/' + want,
+                     'https://huggingface.co/%s/tree/main' % want,
+                     'https://huggingface.co/%s/blob/main/config.json' % want,
+                     'https://huggingface.co/%s?library=transformers' % want):
+            self.assertEqual(hub.normalize_repo_id(text), want, text)
+        for bad in ('https://evil.example/HuggingFaceTB/x',
+                    'https://huggingface.co/datasets'):
+            with self.assertRaises(hub.HubError):
+                hub.check_repo_id(hub.normalize_repo_id(bad))
+
+    def test_error_messages_drop_signed_urls(self):
+        e = OSError("HTTPSConnectionPool(host='cdn.example', port=443): Max "
+                    "retries exceeded with url: /xet/abc?Signature=SECRET "
+                    "(Caused by ProxyError('403'))")
+        msg = hub._short(e)
+        self.assertNotIn('SECRET', msg)
+        self.assertIn('cdn.example', msg)
+        self.assertNotIn('SECRET', hub._short(
+            OSError('GET https://cdn.example/x?Signature=SECRET failed')))
+
     def test_select(self):
         files = {n: {} for n in model_files()}
         self.assertEqual(hub.select_files(files),

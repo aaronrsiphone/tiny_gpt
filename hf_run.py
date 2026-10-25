@@ -34,7 +34,7 @@ import time
 # ============================================================== settings
 # Edit these when running from Pythonista (no command-line arguments).
 
-MODEL_ID = 'HuggingFaceTB/SmolLM2-135M-Instruct'
+MODEL_ID = 'HuggingFaceTB/SmolLM2-135M-Instruct'   # or a huggingface.co URL
 MODE = 'chat'           # download | chat | ask | complete | import |
                         # bench | selftest | info
 PROMPT = 'What is the capital of France?'   # for ask / complete
@@ -494,13 +494,18 @@ def mode_selftest(s):
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     s = settings_from_argv(argv) if argv else settings_from_globals()
+    from tinygpt.hf import hub
+    s['model'] = hub.normalize_repo_id(s['model'])
     fn = {'download': mode_download, 'import': mode_import,
           'info': mode_info, 'chat': mode_chat,
           'ask': mode_ask, 'complete': lambda s: mode_ask(s, raw=True),
           'bench': mode_bench, 'selftest': mode_selftest}.get(s['mode'])
     if fn is None:
         raise SystemExit('unknown MODE %r' % s['mode'])
-    fn(s)
+    try:
+        fn(s)
+    except hub.HubError as e:
+        raise SystemExit('error: %s' % e)
 
 
 if __name__ == '__main__':

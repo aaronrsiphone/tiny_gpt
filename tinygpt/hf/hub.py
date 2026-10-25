@@ -72,6 +72,21 @@ def default_cache_dir():
     return os.path.normpath(os.path.join(here, '..', '..', 'hf_models'))
 
 
+_URL_RE = re.compile(r'^(?:https?://)?(?:www\.)?(?:huggingface\.co|hf\.co)/'
+                     r'([^/?#]+/[^/?#]+)(?:/(?:tree|blob|resolve)/[^?#]*)?'
+                     r'/?(?:[?#].*)?$')
+
+
+def normalize_repo_id(text):
+    '''Accept 'owner/name' or a model page URL as copied from a browser
+    (https://huggingface.co/owner/name, optionally .../tree/main), and
+    return 'owner/name'. Anything else is returned unchanged for
+    check_repo_id() to reject.'''
+    text = (text or '').strip()
+    m = _URL_RE.match(text)
+    return m.group(1) if m else text
+
+
 def check_repo_id(repo_id):
     if not REPO_RE.match(repo_id or '') or '..' in repo_id:
         raise HubError('not a model repository id: %r (expected '
@@ -261,6 +276,7 @@ def shards_from_index(path):
 def _short(e):
     # requests errors embed the full (signed, very long) CDN URL.
     msg = re.sub(r'(https?://[^/\s]+)/\S+', r'\1/...', str(e))
+    msg = re.sub(r'(url: )/\S+', r'\1/...', msg)
     return '%s: %s' % (e.__class__.__name__, msg[:300])
 
 
