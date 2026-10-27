@@ -39,7 +39,7 @@ import numpy as np
 
 from tinygpt import backend
 from tinygpt.backend import gemm, gemv, vexp
-from tinygpt.hf.safetensors import Checkpoint, to_f32
+from tinygpt.hf.safetensors import Checkpoint, to_f32, widener
 
 
 class UnsupportedModel(ValueError):
@@ -398,7 +398,9 @@ class Linear(object):
     `parts` are (raw array, stored dtype) pairs stacked along the output
     axis. In float32 mode they are widened once into one contiguous
     matrix; in lowmem mode they are kept as the raw mapped arrays and
-    widened a slab of rows at a time into the shared scratch buffer.
+    widened a slab of rows at a time into the shared scratch buffer. The
+    slabs are fixed, so each one's conversion is set up once at load
+    (`_slabs`); per token only the widening and the product remain.
     '''
 
     def __init__(self, parts, mode, mv, scratch=None, bias=None):
@@ -425,22 +427,32 @@ class Linear(object):
             self.parts = parts
             self._mv = None
             self.mvtuner = mv
+            self._slabs = self._plan_slabs()
+
+    def _plan_slabs(self):
+        '''(widen, W, a, b): widen() fills W, a scratch view, with output
+        rows [a, b) as float32.'''
+        rows = max(1, self.scratch.size // self.n_in)
+        plan = []
+        r = 0
+        for raw, dt in self.parts:
+            n = raw.shape[0]
+            for a in range(0, n, rows):
+                b = min(n, a + rows)
+                W = self.scratch[:(b - a) * self.n_in].reshape(
+                    b - a, self.n_in)
+                plan.append((widener(raw[a:b], dt, W), W, r + a, r + b))
+            r += n
+        return plan
 
     def matvec(self, x, y):
         if self.W is not None:
             self._mv(self.W, x, y)
         else:
-            rows = max(1, self.scratch.size // self.n_in)
-            r = 0
-            for raw, dt in self.parts:
-                n = raw.shape[0]
-                for a in range(0, n, rows):
-                    b = min(n, a + rows)
-                    W = self.scratch[:(b - a) * self.n_in].reshape(
-                        b - a, self.n_in)
-                    to_f32(raw[a:b], dt, out=W)
-                    self.mvtuner.tune(W)(W, x, y[r + a:r + b])
-                r += n
+            tune = self.mvtuner.tune
+            for widen, W, a, b in self._slabs:
+                widen()
+                tune(W)(W, x, y[a:b])
         if self.bias is not None:
             y += self.bias
         return y
@@ -450,19 +462,11 @@ class Linear(object):
         if self.W is not None:
             self._mm(self.W, X, Y)
         else:
-            rows = max(1, self.scratch.size // self.n_in)
-            r = 0
-            for raw, dt in self.parts:
-                n = raw.shape[0]
-                for a in range(0, n, rows):
-                    b = min(n, a + rows)
-                    W = self.scratch[:(b - a) * self.n_in].reshape(
-                        b - a, self.n_in)
-                    to_f32(raw[a:b], dt, out=W)
-                    tmp = np.empty((X.shape[0], b - a), np.float32)
-                    self.mvtuner.tune_mm(W)(W, X, tmp)
-                    Y[:, r + a:r + b] = tmp
-                r += n
+            for widen, W, a, b in self._slabs:
+                widen()
+                tmp = np.empty((X.shape[0], b - a), np.float32)
+                self.mvtuner.tune_mm(W)(W, X, tmp)
+                Y[:, a:b] = tmp
         if self.bias is not None:
             Y += self.bias
         return Y

@@ -47,7 +47,8 @@ TOP_K = None            # 0 = off
 TOP_P = None            # 1.0 = off
 REPETITION_PENALTY = None   # 1.0 = off
 CONTEXT_LIMIT = 1024    # tokens of KV cache; ~7 MB per 100 for SmolLM2-135M
-WEIGHTS = 'auto'        # 'auto': float32 for small models, lowmem otherwise
+WEIGHTS = 'auto'        # 'auto': lowmem with Accelerate (faster there);
+                        #   elsewhere float32 for small models, else lowmem
                         # 'float32': widened once at load, 4 bytes/param
                         # 'lowmem': weights stay in the file (~0 MB counted
                         #           against the app), widened as used
@@ -221,18 +222,27 @@ def locate(s):
         % s['model'])
 
 
-# 'auto' picks float32 up to this many MB of float32 weights. Measured on
-# an iPhone: float32 decoded 1.5x faster than lowmem at 135M params (540
-# MB), and no faster at 360M (1.45 GB) while using ~1.8 GB more memory.
+# 'auto' picks lowmem whenever BF16 is widened by BNNSCopy: on an iPhone 16
+# Pro, SmolLM2-135M then decoded at ~88 tok/s in lowmem against ~79 in
+# float32, at 180 MB footprint instead of 683 MB. Without BNNSCopy (NumPy
+# widening, e.g. Linux or an old iOS) it picks float32 up to this many MB
+# of float32 weights: there float32 decoded 1.5x faster than lowmem at 135M
+# params (540 MB), and no faster at 360M (1.45 GB) while using ~1.8 GB more
+# memory.
 AUTO_FLOAT32_MAX_MB = 1000
 # Explicit float32 above this is refused on iOS: the system would kill
 # Pythonista without any Python-level MemoryError.
 IOS_FLOAT32_MAX_MB = 2500
 
 
-def resolve_weights(mode, cfg):
+def resolve_weights(mode, cfg, have_bnns_copy=None):
     if mode != 'auto':
         return mode
+    if have_bnns_copy is None:
+        from tinygpt import backend
+        have_bnns_copy = backend.HAVE_BNNS_COPY
+    if have_bnns_copy:
+        return 'lowmem'
     return 'float32' if cfg.n_params() * 4 <= AUTO_FLOAT32_MAX_MB << 20 \
         else 'lowmem'
 
