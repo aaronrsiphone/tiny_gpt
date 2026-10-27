@@ -223,10 +223,15 @@ def show_template(tpl, tcfg, src_name):
     if not tpl:
         print('  none: completion only')
         return
-    feats = [f for f in ('bos_token', 'strftime_now', 'generation',
-                         'raise_exception', 'tools', 'enable_thinking',
-                         '<think>', 'tojson', 'namespace')
-             if f in tpl]
+    checks = (('bos_token', r'\bbos_token\b'),
+              ('strftime_now', r'\bstrftime_now\b'),
+              ('{% generation %}', r'\{%-?\s*generation\b'),
+              ('raise_exception', r'\braise_exception\b'),
+              ('tools', r'\btools\b'),
+              ('enable_thinking', r'\benable_thinking\b'),
+              ('<think>', r'<think>'), ('tojson', r'\btojson\b'),
+              ('namespace', r'\bnamespace\('))
+    feats = [name for name, rx in checks if re.search(rx, tpl)]
     print('  %d chars; uses: %s' % (len(tpl), ', '.join(feats) or '-'))
     try:
         from tinygpt.hf.tokenizer import BPETokenizer, ChatFormat  # noqa
