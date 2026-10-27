@@ -263,7 +263,8 @@ def main(argv):
     remote = '--remote' in argv
     args = [a for a in argv if a != '--remote']
     if len(args) != 1:
-        raise SystemExit(__doc__)
+        print(__doc__)
+        return
     target = args[0]
     if remote:
         src = Remote(target)
@@ -275,7 +276,8 @@ def main(argv):
         from tinygpt.hf import hub
         path = hub.find_local(hub.normalize_repo_id(target))
         if not path:
-            raise SystemExit('%s is not cached; use --remote' % target)
+            print('%s is not cached; use --remote' % target)
+            return
         src = Local(path)
         print(path)
 

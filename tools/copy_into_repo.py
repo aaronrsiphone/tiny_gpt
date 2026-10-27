@@ -19,10 +19,12 @@ SKIP = {os.path.basename(__file__), '.DS_Store'}
 def main():
     target = TARGET or os.path.expanduser('~/Documents/tiny_gpt')
     if not os.path.isdir(os.path.join(target, 'tinygpt')):
-        raise SystemExit('%s does not look like tiny_gpt; set TARGET at the '
-                         'top of this script.' % target)
+        print('%s does not look like tiny_gpt; set TARGET at the top of '
+              'this script.' % target)
+        return
     if os.path.realpath(HERE) == os.path.realpath(target):
-        raise SystemExit('run this from the unzipped folder, not tiny_gpt')
+        print('run this from the unzipped folder, not from tiny_gpt')
+        return
     n = 0
     for d, dirs, files in os.walk(HERE):
         dirs[:] = [x for x in dirs if x != '__pycache__']
