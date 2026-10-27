@@ -102,8 +102,8 @@ Design points:
   `backend.py` gained a `gemv()` wrapper; `gemm()` is unchanged.
 - **Two weight modes, picked automatically.** `WEIGHTS = 'auto'` uses
   float32 up to ~1 GB of float32 weights and lowmem above that. On an
-  iPhone, float32 was 1.5x faster at 135M params and no faster at 360M,
-  while using 1.8 GB more memory. Explicit float32 is refused on iOS when
+  iPhone, before BNNSCopy widening, float32 was 1.5x faster at 135M params
+  and no faster at 360M, while using 1.8 GB more memory. Explicit float32 is refused on iOS when
   it would need over 2.5 GB, because iOS kills the app without any Python
   error. `float32` reads each tensor with a plain file read
   (no memory map, so no BF16 pages stay mapped into the process) and widens
@@ -111,7 +111,8 @@ Design points:
   leaves the weights in the memory-mapped file in their stored dtype and
   widens a slab at a time into an 8 MB scratch buffer. That keeps resident
   weight memory to the OS's clean, droppable file cache, at roughly 1.5x (iPhone) to 4-5x (Linux)
-  slower decoding (measured before BNNSCopy widening; see below). Lowmem requires the memory map. If iOS can't map the
+  slower decoding before BNNSCopy widening. With it, lowmem decodes faster
+  than float32 on an iPhone (see Performance), on Linux still slower. Lowmem requires the memory map. If iOS can't map the
   file, loading fails with a clear error rather than reading gigabytes
   into RAM.
 - **BF16 is widened by Accelerate's `BNNSCopy`** when it is available,
@@ -176,28 +177,23 @@ The SmolLM2 tests skip unless the model is cached.
 
 SmolLM2-135M-Instruct, 51-token prompt, greedy decoding.
 
-iPhone, Pythonista (Python 3.10, NumPy 1.22, Accelerate):
+iPhone 16 Pro, iOS 27.2, Pythonista (Python 3.10, NumPy 1.22, Accelerate),
+`hf_run.py selftest`:
 
-| weights | load | first token | decode | footprint (Pythonista alone ~90-120 MB) |
-|---------|------|-------------|--------|-----------------------------------------|
-| float32 | 3.6 s  | 0.07 s | ~78 tok/s (12.8 ms/token) | 727 MB after load, 661 MB generating |
-| lowmem  | 0.01 s | 0.075 s (0.6-0.85 s cold) | ~52 tok/s (19.3 ms/token) | 119 MB after load, 133 MB generating |
+| weights | load | first token | decode | footprint |
+|---------|------|-------------|--------|-----------|
+| float32 | 3.5 s  | 0.07 s | ~79 tok/s (12.7 ms/token) | 742 MB after load, 683 MB generating |
+| lowmem  | 0.02 s | 0.07 s (0.93 s cold) | ~88 tok/s (11.3 ms/token) | 135 MB after load, 180 MB generating |
+
+Both produce the same greedy text. Lowmem was ~52 tok/s (19.3 ms/token)
+before BF16 widening moved from NumPy to BNNSCopy, and is now faster than
+float32 at about a quarter of the memory. `tools/native16_bench.py` shows
+why: one token's matrix-vector work takes 15.0 ms with NumPy widening,
+8.75 ms with BNNSCopy, and 10.75 ms on float32 weights, which stream twice
+the bytes from memory.
 
 On iOS, Accelerate wins every product by 20-180x over Pythonista's
 BLAS-less NumPy; `cblas_sgemv` and a one-row `cblas_sgemm` tie.
-
-The table predates BNNSCopy widening. `tools/native16_bench.py` on an
-iPhone 16 Pro (iOS 27.2) timed the matrix-vector work of one token over
-SmolLM2-135M's mapped BF16 weights:
-
-| widening | ms per token (matvec only) | memory added |
-|----------|----------------------------|--------------|
-| NumPy (lowmem in the table above) | 15.0 | 8 MB scratch |
-| BNNSCopy (now the default) | 8.75 | 8 MB scratch |
-| none: float32 weights | 10.75 | 650 MB |
-
-End-to-end tokens/sec with BNNSCopy have not been measured yet; rerun
-`hf_run.py selftest` to update the table.
 
 4-vCPU Linux container (NumPy + OpenBLAS, no Accelerate):
 
