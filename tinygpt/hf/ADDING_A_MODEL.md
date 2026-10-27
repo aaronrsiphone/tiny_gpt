@@ -374,8 +374,14 @@ repetition_penalty 1.1, eos [124900].
    `tokenizers` (digit-group regex, decode with the ByteLevel decoder's
    `add_prefix_space: true`; check that it really changes nothing on
    decode).
-2. Reference: the user can point to a **transformers branch with native
-   `lfm3` support**. Ask for it and install it into the scratch venv
+2. Reference. Checked 2026-10-27: the latest transformers release (5.21.0)
+   still has no native `lfm3`, and Liquid's announcement (huggingface.co/
+   blog/LiquidAI/lfm3) loads LFM3-1.7B with `pip install -U transformers`
+   **plus `trust_remote_code=True`**. "Works with the latest transformers"
+   means the repo's own code runs on it. So the reference is the repo's
+   `modeling_lfm3.py`, and running it needs the user's explicit OK.
+   Preferred alternative, if one appears: a **transformers branch with
+   native `lfm3` support**. Ask for it and install it into the scratch venv
    (`pip install git+https://github.com/<owner>/transformers@<branch>`).
    That is the preferred reference, since no repository code runs.
    Fallbacks, in order: the repo's `modeling_lfm3.py` via
