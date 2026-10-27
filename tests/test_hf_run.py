@@ -73,14 +73,21 @@ class AutoWeightsTest(unittest.TestCase):
 
             def n_params(self):
                 return self.n
-        self.assertEqual(hf_run.resolve_weights('auto', Cfg(135e6)),
-                         'float32')
-        self.assertEqual(hf_run.resolve_weights('auto', Cfg(362e6)),
-                         'lowmem')
-        self.assertEqual(hf_run.resolve_weights('auto', Cfg(1.5e9)),
-                         'lowmem')
-        self.assertEqual(hf_run.resolve_weights('float32', Cfg(1.5e9)),
-                         'float32')
+        r = hf_run.resolve_weights
+        # NumPy widening: float32 while it fits
+        self.assertEqual(r('auto', Cfg(135e6), False), 'float32')
+        self.assertEqual(r('auto', Cfg(362e6), False), 'lowmem')
+        self.assertEqual(r('auto', Cfg(1.5e9), False), 'lowmem')
+        # BNNSCopy widening: lowmem is faster at every size
+        self.assertEqual(r('auto', Cfg(135e6), True), 'lowmem')
+        self.assertEqual(r('auto', Cfg(1.5e9), True), 'lowmem')
+        # explicit choices are kept either way
+        self.assertEqual(r('float32', Cfg(1.5e9), True), 'float32')
+        self.assertEqual(r('float32', Cfg(135e6), False), 'float32')
+        # default: whatever this machine has
+        from tinygpt import backend
+        self.assertEqual(r('auto', Cfg(135e6)),
+                         'lowmem' if backend.HAVE_BNNS_COPY else 'float32')
 
 
 class MmapRequiredTest(unittest.TestCase):

@@ -17,8 +17,8 @@ identical greedy output):
 
 | Model | Architecture | Weights mode | iPhone decode |
 |-------|--------------|--------------|---------------|
-| [HuggingFaceTB/SmolLM2-135M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct) | Llama | float32 | ~78 tok/s |
-| [HuggingFaceTB/SmolLM2-360M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct) | Llama | lowmem | ~21 tok/s (same tokenizer and template as 135M; logits not separately checked) |
+| [HuggingFaceTB/SmolLM2-135M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct) | Llama | lowmem | ~88 tok/s (float32: ~79) |
+| [HuggingFaceTB/SmolLM2-360M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct) | Llama | lowmem | ~21 tok/s before BNNSCopy widening, not remeasured (same tokenizer and template as 135M; logits not separately checked) |
 | [Qwen/Qwen2.5-Coder-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct) | Qwen2 | lowmem | not yet measured |
 | [Qwen/Qwen2.5-Coder-1.5B](https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B) | Qwen2 | lowmem | not yet measured |
 
@@ -101,7 +101,9 @@ Design points:
   `TINY_GPT_MATVEC` / `TINY_GPT_MATMUL` force a choice for A/B runs.
   `backend.py` gained a `gemv()` wrapper; `gemm()` is unchanged.
 - **Two weight modes, picked automatically.** `WEIGHTS = 'auto'` uses
-  float32 up to ~1 GB of float32 weights and lowmem above that. On an
+  lowmem whenever BF16 is widened by BNNSCopy (Accelerate), since it is
+  then both faster and smaller. Without it, auto uses float32 up to ~1 GB
+  of float32 weights and lowmem above that. On an
   iPhone, before BNNSCopy widening, float32 was 1.5x faster at 135M params
   and no faster at 360M, while using 1.8 GB more memory. Explicit float32 is refused on iOS when
   it would need over 2.5 GB, because iOS kills the app without any Python
