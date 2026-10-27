@@ -29,7 +29,7 @@ TEXT_FILES = ('config.json', 'generation_config.json', 'tokenizer.json',
               'tokenizer_config.json', 'special_tokens_map.json',
               'chat_template.jinja', 'model.safetensors.index.json')
 
-# config.json keys tinygpt/hf/llama.py reads or knowingly ignores. Anything
+# config.json keys tinygpt/hf/ reads or knowingly ignores. Anything
 # else is printed, since an unfamiliar key often means an unfamiliar feature.
 KNOWN_KEYS = set('''
 architectures model_type hidden_size intermediate_size num_hidden_layers
@@ -40,6 +40,7 @@ pad_token_id hidden_act pretraining_tp sliding_window use_sliding_window
 max_window_layers layer_types torch_dtype dtype transformers_version
 use_cache initializer_range attention_dropout rope_interleaved
 is_llama_config transformers.js_config _name_or_path
+norm_eps conv_L_cache conv_bias use_sandwich_norm
 '''.split())
 
 
@@ -139,7 +140,7 @@ def show_config(cfg):
             '%d:%s' % (i, t[:4]) for i, t in enumerate(lt)))
     extra = sorted(set(cfg) - KNOWN_KEYS - {'auto_map'})
     if extra:
-        print('  not read by llama.py:    %s' % ', '.join(
+        print('  not read by tinygpt:     %s' % ', '.join(
             '%s=%s' % (k, json.dumps(cfg[k])) for k in extra))
 
 
@@ -248,8 +249,8 @@ def show_template(tpl, tcfg, src_name):
 def show_support(cfg, params, size):
     section('support check')
     try:
-        from tinygpt.hf.llama import LlamaConfig
-        c = LlamaConfig(cfg)
+        from tinygpt.hf.models import config_from_dict
+        c = config_from_dict(cfg)
         print('  model: OK -- %s' % c.describe())
     except Exception as e:
         print('  model: NOT YET -- %s: %s' % (e.__class__.__name__, e))

@@ -1,6 +1,6 @@
 # Hugging Face inference
 
-Run pretrained Hugging Face models (Llama / Qwen2 families) offline on NumPy
+Run pretrained Hugging Face models (Llama, Qwen2 and LFM3 families) offline on NumPy
 and Accelerate, from a laptop to an iPhone in Pythonista. The code lives in
 this folder (`tinygpt/hf/`) and is driven by `hf_run.py` at the repository
 root. It shares only the BLAS bindings in `tinygpt/backend.py` with the
@@ -21,6 +21,14 @@ identical greedy output):
 | [HuggingFaceTB/SmolLM2-360M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct) | Llama | lowmem | ~21 tok/s before BNNSCopy widening, not remeasured (same tokenizer and template as 135M; logits not separately checked) |
 | [Qwen/Qwen2.5-Coder-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct) | Qwen2 | lowmem | not yet measured |
 | [Qwen/Qwen2.5-Coder-1.5B](https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B) | Qwen2 | lowmem | not yet measured |
+| [LiquidAI/LFM3-1.7B](https://huggingface.co/LiquidAI/LFM3-1.7B) | LFM3 | lowmem | not yet measured (see the note below) |
+
+LFM3 is the exception to "verified against transformers". transformers
+has no built-in `lfm3`; the only reference is the model repository's own
+`modeling_lfm3.py`, which would have to run with `trust_remote_code`, and
+that wasn't done. Instead the conv/attention/norm parts are checked
+against transformers' built-in LFM2, and the LFM3-only parts against a
+PyTorch transcription of `modeling_lfm3.py` (see Verification).
 
 Other models with these architectures and a byte-level BPE tokenizer
 should work too. To find out what a model needs, run
@@ -88,6 +96,8 @@ The capital of France is Paris.
 | `safetensors.py` | Pure-Python reader (struct + json + mmap). Tensors are zero-copy views onto the mapped file. Every offset, length, shape and dtype is validated before bytes are read. Handles F32, F16 and BF16 (an exact 16-bit shift), plus sharded checkpoints through `model.safetensors.index.json`. |
 | `tokenizer.py` | Byte-level BPE from `tokenizer.json`: added/special tokens, NFC normalization, the Digits, Split (regex translated to Python's `re`) and ByteLevel pre-tokenizers, and the same priority-queue merge order as the Rust library. Includes a streaming UTF-8 decoder and the chat template, rendered in Jinja2's sandbox exactly as transformers does it. Configurations it doesn't implement exactly are refused at load. |
 | `unicode_tables.py` | `\p{L}`, `\p{N}`, `\s` and Rust `is_numeric` as codepoint ranges, measured from the reference `tokenizers` library (`tools/gen_unicode_tables.py`). It also lists the combining marks that library's older NFC tables leave alone. This keeps tokenization from drifting with Pythonista's Unicode database. |
+| `models.py` | Picks the forward pass for a `config.json` by `model_type`. |
+| `lfm3.py` | LFM3: a hybrid of gated short convolutions (kernel 7) and grouped-query attention with QK-norm, a sigmoid gate per head, sandwich norms, "zero-tail" partial RoPE on full-attention layers and a 256-token window on sliding-attention layers. Reuses `llama.py`'s matrix products, weight modes and sampler. The cache keeps every position's conv input, so a chat can rewind to any earlier point and reuse the shared prefix. |
 | `llama.py` | The model (Llama and Qwen2): RMSNorm, rotate-half RoPE (including `linear`/`llama3` scaling), grouped-query attention, a preallocated KV cache, SwiGLU, tied or untied heads, and per-projection biases (Qwen2's q/k/v). All dimensions come from `config.json`, in either the transformers 4 or 5 layout. Prompts are prefilled with matrix-matrix products and decoding uses matrix-vector products. Also contains the sampler (greedy, temperature, top-k, top-p, repetition penalty). |
 
 Design points:
@@ -159,6 +169,16 @@ against fixtures produced by the official libraries
   to ~3e-5 in both weight modes. The Instruct model's chat answer
   (template, tokenizer, model and repetition penalty together) matches
   transformers' greedy answer token for token.
+- **LFM3**: tokenizer ids identical to `tokenizers` on 4,000+ texts (it
+  uses `ignore_merges` and digit groups of up to three). A tiny LFM3 reduced
+  to what transformers' built-in LFM2 computes matches LFM2's float32 logits
+  in both weight modes, for prefill and cached decoding. A second tiny LFM3
+  with every LFM3 feature (sandwich norms, gate, zero-tail RoPE, a sliding
+  window of 5 over 30 tokens) matches an unoptimised PyTorch transcription
+  of `modeling_lfm3.py`, including after `feed()` rewinds the cache. The
+  real 1.7B model's parameter count matches the repository's, and it answers
+  sensibly in chat (it multiplies correctly and recalls a code from 600
+  tokens earlier).
 - **SmolLM2-135M-Instruct**: logits match `transformers` float32 to <1e-4
   at every prompt position, and a 48-token greedy decode is token-for-token
   identical. Inference runs with sockets disabled to prove it's offline.
@@ -216,10 +236,16 @@ Pythonista, because its interpreter stays alive between runs.
 
 ## Limitations
 
-- Llama and Qwen2 architectures only (`LlamaForCausalLM`,
-  `Qwen2ForCausalLM`, SiLU, no `pretraining_tp`). Others fail with a clear
+- Llama, Qwen2 and LFM3 architectures only (`LlamaForCausalLM`,
+  `Qwen2ForCausalLM`, `Lfm3ForCausalLM`; SiLU, no `pretraining_tp`; LFM3
+  without `conv_bias` and with `default` RoPE). Others fail with a clear
   `unsupported model` error. So do tokenizers that aren't byte-level BPE
   (SentencePiece, byte fallback) or need a normalizer other than NFC.
+- LFM3-1.7B is 3.5 GB of BF16 weights (6.9 GB in float32), so on a phone
+  it runs in lowmem mode only. Its cache costs about 148 KB per token (keys and
+  values for 11 attention layers, conv input for 13), so a 1024-token
+  context takes about 155 MB. On the Linux container it decodes
+  at ~6 tok/s in float32.
 - Qwen2 sliding-window attention isn't implemented. The context limit is
   capped at the window instead, which is exact, since the window then
   never takes effect.

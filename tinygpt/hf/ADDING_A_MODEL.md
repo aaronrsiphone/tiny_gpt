@@ -130,7 +130,12 @@ Where the code goes:
   attention output): write a sibling module, e.g. `tinygpt/hf/lfm3.py`,
   that reuses the shared pieces from `llama.py`: `Linear`, `MatVec`,
   `rms_norm`, `silu_mul`, `softmax_last`, `rope_rotate`, `Sampler`,
-  `generate`. Have `hf_run.load()` dispatch on `model_type`.
+  `generate`. Register it in `tinygpt/hf/models.py` (`_families()`), which
+  `hf_run.load()` and `tools/hf_probe.py` use to dispatch on `model_type`.
+  `tinygpt/hf/lfm3.py` is the worked example. The config class needs
+  `n_params()`, `kv_bytes(ctx)`, `describe()`, `max_context`, `eos_ids`;
+  the model needs `from_dir`, `new_cache`, `step`, `prefill`, `feed`,
+  `close`, `mv`, `ctx_limit`, `weights`.
 
 Conventions the shared code relies on:
 
@@ -146,10 +151,15 @@ Conventions the shared code relies on:
   `cache.length`, `truncate(n)`. A state that can't be rewound (a conv or
   SSM state) needs either a snapshot per position or a rewind by
   re-prefilling from the start. Pick one and test the chat-turn reuse.
-- `ContextFull` when the cache is full. Sliding-window layers need a
-  window-sized ring buffer if the window is smaller than `CONTEXT_LIMIT`.
-  Capping the context at the window, as for Qwen2, is only acceptable
-  when the window is large.
+  (LFM3 keeps each conv layer's input for every position: one row per
+  token, which is what a snapshot per position costs at minimum.)
+- `ContextFull` when the cache is full. Sliding-window layers need a real
+  window if it is smaller than `CONTEXT_LIMIT`: either a ring buffer, or
+  (simpler, and what LFM3 does) the full cache with each query attending
+  only to keys `(p - window, p]`. That is transformers' rule
+  (`sliding_window_overlay`: `kv_idx > q_idx - sliding_window`). Capping
+  the context at the window, as for Qwen2, is only acceptable when the
+  window is large.
 - Validate every tensor's shape against the config at load
   (`raw(name, shape)` does this) and raise `UnsupportedModel` with the
   name of anything missing or unexpected.
@@ -208,6 +218,16 @@ LFS-tracked.
   weights rounded to the checkpoint dtype, and compute the reference
   logits in float32 *from the rounded weights*. One fixture per distinct
   layer mix (e.g. conv + full + sliding).
+- **No library reference?** If transformers lacks the architecture, look
+  for a built-in sibling and build a tiny model of the new type that
+  reduces exactly to it (LFM3 → LFM2: no sandwich norms, full RoPE, gate
+  weights zero so the gate is a constant 1/2, made up for by doubling
+  `o_proj`; see `tiny_lfm3_via_lfm2()`). That checks the shared parts
+  against library code. For the rest, transcribe the reference forward
+  pass into plain whole-sequence PyTorch in the generator
+  (`lfm3_reference_forward()`); it shares no code with the NumPy model, so
+  it catches indexing, masking and caching mistakes, though not a misread
+  of the reference.
 - **Real model**: logits at every prompt position on a fixed column subset,
   plus the full last-position logits, plus a 40-token greedy continuation.
   For instruct models, add one chat turn decoded greedily with the model's
@@ -218,7 +238,8 @@ LFS-tracked.
   turns the test into a skip.
 
 Regenerate:
-`$SCRATCH/refenv/bin/python tests/make_hf_fixtures.py <smollm2 dir> <qwen dir> <qwen-instruct dir>`.
+`$SCRATCH/refenv/bin/python tests/make_hf_fixtures.py [--lfm3=<lfm3 dir>] <smollm2 dir> <qwen dir> <qwen-instruct dir>`,
+or only the LFM3 fixtures with `--only-lfm3 [--lfm3=<dir>]`.
 Then `git diff --stat tests/fixtures`. Revert any fixture that changed
 without its inputs changing (`bpe_tiny.json` training is not always
 deterministic).
@@ -300,17 +321,16 @@ training.)
 - iOS kills an app that exceeds its memory without raising `MemoryError`.
   Size before loading.
 
-## Appendix: LFM3-1.7B, what is known so far
+## Appendix: LFM3-1.7B, a worked example
 
-`LiquidAI/LFM3-1.7B` (revision `40ebe0a`), probed remotely on 2026-10-27.
-Nothing downloaded yet.
+`LiquidAI/LFM3-1.7B` (revision `40ebe0a`), added on 2026-10-27 in
+`tinygpt/hf/lfm3.py`. These were the notes taken before writing it.
 
 **Repository**: `model.safetensors` 3.46 GB BF16, 1,728,801,536 params
 (tied embeddings). Custom code (`modeling_lfm3.py`, `lfm3_conv.py`,
 `configuration_lfm3.py`, via `auto_map`). **transformers 5.20.2 has no
 native `lfm3`** (it has `lfm2`, `lfm2_moe`, `lfm2_vl`). The reference
-implementation therefore exists only as the repo's code: running it for
-fixtures needs the user's OK (see §0).
+implementation therefore exists only as the repo's code.
 
 **Config**: hidden 2048, 24 layers, 16 heads / 4 KV heads × 128,
 intermediate 7680, vocab 128000, `norm_eps` 1e-5, `conv_L_cache` 7,
@@ -342,8 +362,8 @@ final: embedding_norm(y)  -- despite the name it is the FINAL norm, applied
   `attn_out[h] *= sigmoid(gate_proj(x))[h]`, one scalar per head
   (`gate_proj` [16, 2048]), on the *normed* input, before `o_proj`.
   Sliding layers attend to the last 256 positions. 256 is far below
-  `CONTEXT_LIMIT`, so they need a real window (ring-buffer KV of 256);
-  capping the context isn't acceptable.
+  `CONTEXT_LIMIT`, so they need a real window; capping the context isn't
+  acceptable.
 - **Short conv**: `B, C, x = chunk(in_proj(h), 3)` along features
   (in_proj [6144, 2048] → 3×2048, in that order). `Bx = B * x`. Then a
   causal depthwise conv over time, kernel 7 (`conv.weight` [2048, 1, 7],
@@ -351,15 +371,15 @@ final: embedding_norm(y)  -- despite the name it is the FINAL norm, applied
   output[t] = Σ_k w[c,k]·Bx[t-6+k]). Then `y = C * conv_out`, then
   `out_proj` [2048, 2048]. Decode state per conv layer: the last 6 (or 7)
   `Bx` columns. Prefix reuse in `feed()` needs that state at the reuse
-  point, so snapshot or recompute.
+  point, so snapshot or recompute. (Done: Bx kept for every position.)
 - **Packed-sequence handling** (`seq_idx`, padding masks): irrelevant for
   single-sequence inference.
 
 **Tokenizer** (`tokenizer.json`, 17.9 MB): no normalizer. Split regex as
 Qwen2's but with `\p{N}{1,3}` (digit groups of up to 3), then ByteLevel
-(use_regex false). BPE with **`ignore_merges: true`** (not supported yet:
-a word that is itself in the vocabulary maps to that id directly, without
-running merges). 124,893 vocab entries + 140 added tokens (124 special,
+(use_regex false). BPE with **`ignore_merges: true`** (a word that is itself in the model
+vocabulary maps to that id directly, without running merges; it changes
+the encoding of 2,459 vocabulary words, e.g. `" struc"`). 124,893 vocab entries + 140 added tokens (124 special,
 16 not; no lstrip/rstrip). Decoder/post-processor are ByteLevel. BOS
 `<|startoftext|>` (124894), EOS `<|im_end|>` (124900), pad `<|pad|>`.
 
@@ -369,32 +389,24 @@ tools, `{% generation %}`, `namespace`. It already renders here with
 jinja2. `generation_config`: do_sample, temperature 0.1, top_k 50,
 repetition_penalty 1.1, eos [124900].
 
-**Plan**:
-1. Tokenizer: implement `ignore_merges`, then exact-match against
-   `tokenizers` (digit-group regex, decode with the ByteLevel decoder's
-   `add_prefix_space: true`; check that it really changes nothing on
-   decode).
-2. Reference. Checked 2026-10-27: the latest transformers release (5.21.0)
-   still has no native `lfm3`, and Liquid's announcement (huggingface.co/
-   blog/LiquidAI/lfm3) loads LFM3-1.7B with `pip install -U transformers`
-   **plus `trust_remote_code=True`**. "Works with the latest transformers"
-   means the repo's own code runs on it. So the reference is the repo's
-   `modeling_lfm3.py`, and running it needs the user's explicit OK.
-   Preferred alternative, if one appears: a **transformers branch with
-   native `lfm3` support**. Ask for it and install it into the scratch venv
-   (`pip install git+https://github.com/<owner>/transformers@<branch>`).
-   That is the preferred reference, since no repository code runs.
-   Fallbacks, in order: the repo's `modeling_lfm3.py` via
-   `trust_remote_code` (executes the repo's code, so only with the user's
-   OK), or native `lfm2` plus an independent check. (The BF16/BNNSCopy
-   branch this builds on was already tested by the user in another
-   session.)
-3. New module `tinygpt/hf/lfm3.py`: a layer list by type, the conv layer
-   with its state, gated attention with QK-norm and zero-tail partial
-   RoPE per layer type, a sliding-window KV, sandwich norms, the final
-   norm. Reuse `Linear` etc.
-4. Fixtures: tiny random LFM3 (needs the reference decision), real logits,
-   greedy, one chat turn. Tests, docs, then the phone `selftest`.
-5. Memory: 6.9 GB float32, so lowmem only (3.46 GB mapped). The phone has
-   already mapped Qwen's 3.1 GB, so this is likely fine, but it isn't
-   proven.
+**How it went**:
+1. Tokenizer: `ignore_merges` implemented (the lookup is in the model's
+   vocabulary, not added tokens). Identical to `tokenizers` on 4,052 texts;
+   the digit-group regex already translated.
+2. Reference: running the repository's `modeling_lfm3.py` via
+   `trust_remote_code` was blocked by the agent's permission system, so it
+   wasn't run. Two substitutes: a tiny LFM3 reduced to transformers'
+   built-in LFM2 (`tiny_lfm3_via_lfm2.json`), and a tiny LFM3 with every
+   feature checked against a PyTorch transcription of the reference
+   (`tiny_lfm3.json`). Each check fails if you shift the sliding window
+   by one or replace the gate with a constant (mutation-tested).
+3. `tinygpt/hf/lfm3.py`: one `_forward` serves decode and prefill. The gate
+   projection is fused into q/k/v (it reads the same normed input).
+   Sliding layers keep the full cache and attend over their window.
+4. Real model: the parameter count matches (1,728,801,536). Greedy
+   completion of "The capital of France is" gives " Paris.". In chat it
+   gets 17 × 23 = 391 right, remembers a name across turns (`feed()`
+   rewinds into the previous answer, because the template drops old
+   `<think>` blocks), and recalls a code from 600 tokens back, past the
+   sliding window. ~6 tok/s float32 on the 4-vCPU container.
+5. Still open: phone `selftest` (lowmem only; 3.46 GB mapped).

@@ -36,6 +36,7 @@ import time
 # Edit these when running from Pythonista (no command-line arguments).
 
 MODEL_ID = 'HuggingFaceTB/SmolLM2-135M-Instruct'   # or a huggingface.co URL
+# Also: 'Qwen/Qwen2.5-Coder-1.5B-Instruct', 'LiquidAI/LFM3-1.7B' (3.5 GB)
 MODE = 'chat'           # download | chat | ask | complete | import |
                         # bench | selftest | info
 PROMPT = 'What is the capital of France?'   # for ask / complete
@@ -46,7 +47,8 @@ TEMPERATURE = None      # 0 = greedy (deterministic)
 TOP_K = None            # 0 = off
 TOP_P = None            # 1.0 = off
 REPETITION_PENALTY = None   # 1.0 = off
-CONTEXT_LIMIT = 1024    # tokens of KV cache; ~7 MB per 100 for SmolLM2-135M
+CONTEXT_LIMIT = 1024    # tokens of KV cache; ~7 MB per 100 for SmolLM2-135M,
+                        # ~15 MB per 100 for LFM3-1.7B
 WEIGHTS = 'auto'        # 'auto': lowmem with Accelerate (faster there);
                         #   elsewhere float32 for small models, else lowmem
                         # 'float32': widened once at load, 4 bytes/param
@@ -68,7 +70,8 @@ if HERE not in sys.path:
 def settings_from_argv(argv):
     import argparse
     p = argparse.ArgumentParser(
-        description='Offline inference for Hugging Face Llama models.')
+        description='Offline inference for Hugging Face models '
+                    '(Llama, Qwen2, LFM3).')
     p.add_argument('mode', choices=['download', 'chat', 'ask', 'complete',
                                     'import', 'bench', 'selftest', 'info'])
     p.add_argument('text', nargs='?', default=None,
@@ -249,7 +252,8 @@ def resolve_weights(mode, cfg, have_bnns_copy=None):
 
 def load(s, quiet=False):
     from tinygpt import backend
-    from tinygpt.hf.llama import LlamaModel, UnsupportedModel
+    from tinygpt.hf.llama import UnsupportedModel
+    from tinygpt.hf.models import config_from_dict, model_from_dir
     from tinygpt.hf.safetensors import SafetensorsError
     from tinygpt.hf.tokenizer import BPETokenizer, ChatFormat
     import json
@@ -257,11 +261,10 @@ def load(s, quiet=False):
     with open(os.path.join(path, 'config.json'), 'rb') as f:
         raw_cfg = json.loads(f.read().decode('utf-8'))
     try:
-        from tinygpt.hf.llama import LlamaConfig
-        cfg = LlamaConfig(raw_cfg)
+        cfg = config_from_dict(raw_cfg)
     except UnsupportedModel as e:
         raise SystemExit('unsupported model: %s' % e)
-    ctx = min(s['ctx'], cfg.max_pos, cfg.sliding_window or cfg.max_pos)
+    ctx = min(s['ctx'], cfg.max_context)
     weights = resolve_weights(s['weights'], cfg)
     est = (cfg.n_params() * 4 if weights == 'float32' else 8 << 20) \
         + cfg.kv_bytes(ctx)
@@ -280,7 +283,7 @@ def load(s, quiet=False):
                  'yes' if backend.HAVE_ACCELERATE else 'no (NumPy only)'))
     t0 = time.time()
     try:
-        model = LlamaModel.from_dir(path, ctx_limit=ctx, weights=weights)
+        model = model_from_dir(path, ctx_limit=ctx, weights=weights)
     except MemoryError:
         raise SystemExit(
             'out of memory loading the weights (needs about %d MB).\n'

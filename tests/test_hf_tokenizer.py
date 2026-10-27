@@ -9,7 +9,7 @@ always available. The SmolLM2 tests run when the model is cached
 import os
 import unittest
 
-from tests.hf_common import fixture, qwen_dir, smollm2_dir
+from tests.hf_common import fixture, lfm3_dir, qwen_dir, smollm2_dir
 from tinygpt.hf.tokenizer import (BPETokenizer, ChatFormat,
                                   UnsupportedTokenizer, bytes_to_unicode,
                                   translate_regex)
@@ -101,6 +101,39 @@ class TranslateRegexTest(unittest.TestCase):
                     r'\bx', r'[\P{L}]', r'[abc'):
             with self.assertRaises(UnsupportedTokenizer, msg=pat):
                 translate_regex(pat)
+
+
+class IgnoreMergesTest(unittest.TestCase):
+
+    def test_whole_word_wins(self):
+        # 'abc' is in the vocabulary, but the merges alone reach a + bc.
+        vocab = {c: i for i, c in enumerate('abc')}
+        vocab.update({'bc': 3, 'abc': 4, 'X': 5})
+        spec = {'model': {'type': 'BPE', 'vocab': vocab, 'merges': ['b c'],
+                          'ignore_merges': False},
+                'pre_tokenizer': {'type': 'ByteLevel',
+                                  'add_prefix_space': False,
+                                  'use_regex': True},
+                'added_tokens': [{'id': 6, 'content': 'cab',
+                                  'special': False}]}
+        self.assertEqual(BPETokenizer(spec).encode('abc'), [0, 3])
+        spec['model']['ignore_merges'] = True
+        tok = BPETokenizer(spec)
+        self.assertEqual(tok.encode('abc'), [4])
+        self.assertEqual(tok.encode('bc'), [3])
+        # The lookup is in the model's vocabulary only, not added tokens.
+        self.assertEqual(tok.encode('cab'), [6])
+        self.assertEqual(tok.encode('cab', allow_special=False), [2, 0, 1])
+
+
+@unittest.skipUnless(lfm3_dir(), 'LFM3-1.7B not cached')
+class Lfm3TokenizerTest(unittest.TestCase):
+    '''ignore_merges and digit groups of up to three.'''
+
+    def test_texts(self):
+        d = fixture('lfm3_tokens.json')
+        tok = BPETokenizer.from_dir(lfm3_dir())
+        check_against(self, tok, d['texts'], d['ids'])
 
 
 @unittest.skipUnless(qwen_dir(), 'Qwen2.5-Coder-1.5B not cached')
