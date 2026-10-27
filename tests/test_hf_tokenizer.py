@@ -6,11 +6,13 @@ always available. The SmolLM2 tests run when the model is cached
 (python hf_run.py download, or import of the zip).
 '''
 
+import os
 import unittest
 
-from tests.hf_common import fixture, smollm2_dir
+from tests.hf_common import fixture, qwen_dir, smollm2_dir
 from tinygpt.hf.tokenizer import (BPETokenizer, ChatFormat,
-                                  UnsupportedTokenizer, bytes_to_unicode)
+                                  UnsupportedTokenizer, bytes_to_unicode,
+                                  translate_regex)
 
 
 class ByteMapTest(unittest.TestCase):
@@ -60,7 +62,7 @@ class TinyBPETest(unittest.TestCase):
     def test_unsupported_configs_rejected(self):
         import copy
         for mutate in (
-                lambda s: s.__setitem__('normalizer', {'type': 'NFC'}),
+                lambda s: s.__setitem__('normalizer', {'type': 'NFKC'}),
                 lambda s: s['model'].__setitem__('byte_fallback', True),
                 lambda s: s['model'].__setitem__('dropout', 0.1),
                 lambda s: s.__setitem__('pre_tokenizer',
@@ -70,6 +72,44 @@ class TinyBPETest(unittest.TestCase):
             mutate(spec)
             with self.assertRaises(UnsupportedTokenizer):
                 BPETokenizer(spec)
+
+
+class TinyQwenBPETest(unittest.TestCase):
+    '''A small tokenizer trained with Qwen2's pipeline: NFC normalizer,
+    Split regex with case-insensitive contractions, ByteLevel without
+    its own regex. Its texts include combining marks the reference's
+    older NFC tables leave alone.'''
+
+    def test_encode_decode_exact(self):
+        d = fixture('bpe_tiny_qwen.json')
+        tok = BPETokenizer(d['tokenizer'])
+        check_against(self, tok, d['texts'], d['ids'], d['decoded'])
+
+
+class TranslateRegexTest(unittest.TestCase):
+
+    def test_qwen_pattern_compiles(self):
+        import re
+        pat = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+"
+               r"|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
+        rx = re.compile(translate_regex(pat))
+        self.assertEqual(rx.findall("I'LL x\u00e9  12"),
+                         ['I', "'LL", ' x\u00e9', ' ', ' ', '1', '2'])
+
+    def test_unsupported_rejected(self):
+        for pat in (r'\d+', r'\w+', r'\p{Lu}', r'[[:alpha:]]', r'[^\S]',
+                    r'\bx', r'[\P{L}]', r'[abc'):
+            with self.assertRaises(UnsupportedTokenizer, msg=pat):
+                translate_regex(pat)
+
+
+@unittest.skipUnless(qwen_dir(), 'Qwen2.5-Coder-1.5B not cached')
+class QwenTokenizerTest(unittest.TestCase):
+
+    def test_texts(self):
+        d = fixture('qwen_tokens.json')
+        tok = BPETokenizer.from_dir(qwen_dir())
+        check_against(self, tok, d['texts'], d['ids'])
 
 
 @unittest.skipUnless(smollm2_dir(), 'SmolLM2 not cached')
@@ -97,11 +137,99 @@ class SmolLM2TokenizerTest(unittest.TestCase):
         self.assertEqual(self.tok.eos_id, 2)
 
     def test_chat_template(self):
-        cf = ChatFormat(self.tok.chat_template)
+        cf = ChatFormat(self.tok.chat_template, self.tok.special_tokens)
         for msgs, text, ids in zip(self.d['chats'], self.d['chat_text'],
                                    self.d['chat_ids']):
             self.assertEqual(cf.render(msgs), text)
             self.assertEqual(self.tok.encode(cf.render(msgs)), ids)
+
+
+try:
+    import jinja2  # noqa: F401
+    HAVE_JINJA = True
+except ImportError:
+    HAVE_JINJA = False
+
+
+class ChatTemplateTest(unittest.TestCase):
+    '''Real templates from several repos against transformers' renderer.'''
+
+    @classmethod
+    def setUpClass(cls):
+        import datetime
+        cls.d = fixture('chat_templates.json')
+        when = datetime.datetime(*cls.d['now'])
+        cls.now = staticmethod(lambda: when)
+
+    @unittest.skipUnless(HAVE_JINJA, 'jinja2 not installed')
+    def test_jinja_matches_transformers(self):
+        n = 0
+        for repo, r in sorted(self.d['repos'].items()):
+            cf = ChatFormat(r['template'], r['special_tokens'], now=self.now)
+            self.assertEqual(cf.engine, 'jinja2')
+            for c in r['cases']:
+                got = cf.render(c['messages'], c['add_generation_prompt'],
+                                **c['kwargs'])
+                self.assertEqual(got, c['text'], '%s %r' % (repo, c))
+                n += 1
+        self.assertGreaterEqual(n, 40)
+
+    def test_fallback_only_for_known_templates(self):
+        for repo, r in sorted(self.d['repos'].items()):
+            if repo == 'HuggingFaceTB/SmolLM2-135M-Instruct':
+                cf = ChatFormat(r['template'], r['special_tokens'],
+                                use_jinja=False)
+                self.assertEqual(cf.engine, 'chatml')
+                for c in r['cases']:
+                    if c['kwargs']:
+                        with self.assertRaises(ValueError):
+                            cf.render(c['messages'], **c['kwargs'])
+                        continue
+                    self.assertEqual(
+                        cf.render(c['messages'], c['add_generation_prompt']),
+                        c['text'])
+            else:
+                with self.assertRaises(UnsupportedTokenizer):
+                    ChatFormat(r['template'], use_jinja=False)
+
+    @unittest.skipUnless(HAVE_JINJA, 'jinja2 not installed')
+    def test_sandbox_and_errors(self):
+        msgs = [{'role': 'user', 'content': 'x'}]
+        evil = ChatFormat("{{ ''.__class__.__mro__[1].__subclasses__() }}")
+        with self.assertRaises(ValueError):
+            evil.render(msgs)
+        strict = ChatFormat("{% if messages[0]['role'] != 'system' %}"
+                            "{{ raise_exception('system first') }}{% endif %}")
+        with self.assertRaises(ValueError) as cm:
+            strict.render(msgs)
+        self.assertIn('system first', str(cm.exception))
+
+    def test_no_template(self):
+        with self.assertRaises(UnsupportedTokenizer):
+            ChatFormat(None)
+
+    def test_template_file_and_named_list(self):
+        import json
+        import shutil
+        import tempfile
+        spec = fixture('bpe_tiny.json')['tokenizer']
+        td = tempfile.mkdtemp()
+        try:
+            with open(os.path.join(td, 'tokenizer.json'), 'w') as f:
+                json.dump(spec, f)
+            with open(os.path.join(td, 'tokenizer_config.json'), 'w') as f:
+                json.dump({'chat_template': [
+                    {'name': 'tool_use', 'template': 'T'},
+                    {'name': 'default', 'template': 'D'}],
+                    'eos_token': {'content': '<|im_end|>'}}, f)
+            tok = BPETokenizer.from_dir(td)
+            self.assertEqual(tok.chat_template, 'D')
+            self.assertEqual(tok.special_tokens, {'eos_token': '<|im_end|>'})
+            with open(os.path.join(td, 'chat_template.jinja'), 'w') as f:
+                f.write('J')
+            self.assertEqual(BPETokenizer.from_dir(td).chat_template, 'J')
+        finally:
+            shutil.rmtree(td)
 
 
 if __name__ == '__main__':

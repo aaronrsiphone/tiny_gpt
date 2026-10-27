@@ -10,7 +10,7 @@ then plain HTTPS downloads with `requests`.
     path = find_local('HuggingFaceTB/SmolLM2-135M-Instruct')   # offline
 
 What is downloaded is an allowlist: config.json, generation_config.json,
-the tokenizer files, and safetensors weights (one file, or shards named
+the tokenizer files and chat template, and safetensors weights (one file, or shards named
 by model.safetensors.index.json). Nothing executable is fetched, and a
 repo that only offers pickled PyTorch weights (*.bin, *.pt) is refused
 rather than loaded: unpickling runs arbitrary code.
@@ -44,7 +44,7 @@ ENDPOINT = os.environ.get('HF_ENDPOINT', 'https://huggingface.co')
 
 REQUIRED = ('config.json', 'tokenizer.json')
 OPTIONAL = ('generation_config.json', 'tokenizer_config.json',
-            'special_tokens_map.json')
+            'special_tokens_map.json', 'chat_template.jinja')
 SINGLE = 'model.safetensors'
 INDEX = 'model.safetensors.index.json'
 SHARD_RE = re.compile(r'^model-\d{5}-of-\d{5}\.safetensors$')
@@ -70,6 +70,21 @@ def default_cache_dir():
         return env
     here = os.path.dirname(os.path.abspath(__file__))
     return os.path.normpath(os.path.join(here, '..', '..', 'hf_models'))
+
+
+_URL_RE = re.compile(r'^(?:https?://)?(?:www\.)?(?:huggingface\.co|hf\.co)/'
+                     r'([^/?#]+/[^/?#]+)(?:/(?:tree|blob|resolve)/[^?#]*)?'
+                     r'/?(?:[?#].*)?$')
+
+
+def normalize_repo_id(text):
+    '''Accept 'owner/name' or a model page URL as copied from a browser
+    (https://huggingface.co/owner/name, optionally .../tree/main), and
+    return 'owner/name'. Anything else is returned unchanged for
+    check_repo_id() to reject.'''
+    text = (text or '').strip()
+    m = _URL_RE.match(text)
+    return m.group(1) if m else text
 
 
 def check_repo_id(repo_id):
@@ -261,6 +276,7 @@ def shards_from_index(path):
 def _short(e):
     # requests errors embed the full (signed, very long) CDN URL.
     msg = re.sub(r'(https?://[^/\s]+)/\S+', r'\1/...', str(e))
+    msg = re.sub(r'(url: )/\S+', r'\1/...', msg)
     return '%s: %s' % (e.__class__.__name__, msg[:300])
 
 

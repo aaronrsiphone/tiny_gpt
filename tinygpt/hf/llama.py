@@ -53,19 +53,29 @@ class ContextFull(RuntimeError):
 # ---------------------------------------------------------------- config
 
 class LlamaConfig(object):
+    '''Architecture of a Llama-family model, read from config.json.
 
-    SUPPORTED_TYPES = ('llama',)
+    Qwen2 is Llama with a bias on the q/k/v projections (but not on o),
+    and optional sliding-window attention; both are expressed here as
+    flags so one forward pass serves both.
+    '''
+
+    # model_type -> the architecture class name its checkpoints declare
+    SUPPORTED_TYPES = {'llama': 'LlamaForCausalLM',
+                       'qwen2': 'Qwen2ForCausalLM'}
 
     def __init__(self, d):
         mt = d.get('model_type')
         if mt not in self.SUPPORTED_TYPES:
             raise UnsupportedModel(
                 'model_type %r is not supported (supported: %s)'
-                % (mt, ', '.join(self.SUPPORTED_TYPES)))
-        archs = d.get('architectures') or ['LlamaForCausalLM']
-        if 'LlamaForCausalLM' not in archs:
-            raise UnsupportedModel('architectures %r: only LlamaForCausalLM'
-                                   % (archs,))
+                % (mt, ', '.join(sorted(self.SUPPORTED_TYPES))))
+        arch = self.SUPPORTED_TYPES[mt]
+        archs = d.get('architectures') or [arch]
+        if arch not in archs:
+            raise UnsupportedModel('architectures %r: only %s for model_type '
+                                   '%r' % (archs, arch, mt))
+        self.model_type = mt
         act = d.get('hidden_act', 'silu')
         if act != 'silu':
             raise UnsupportedModel('hidden_act %r: only silu' % act)
@@ -88,8 +98,19 @@ class LlamaConfig(object):
         self.rope_scaling = d.get('rope_scaling') or rp or None
         self.max_pos = int(d.get('max_position_embeddings', 2048))
         self.tied = bool(d.get('tie_word_embeddings', False))
-        self.attn_bias = bool(d.get('attention_bias', False))
-        self.mlp_bias = bool(d.get('mlp_bias', False))
+        if mt == 'qwen2':
+            self.qkv_bias, self.o_bias, self.mlp_bias = True, False, False
+        else:
+            self.qkv_bias = self.o_bias = bool(d.get('attention_bias', False))
+            self.mlp_bias = bool(d.get('mlp_bias', False))
+        # Sliding-window attention (Qwen2): transformers 5 lists the layer
+        # kinds, transformers 4 has a switch. Within the window it is plain
+        # causal attention, so the context limit is capped at the window.
+        types = d.get('layer_types') or ()
+        sliding = ('sliding_attention' in types if types
+                   else bool(d.get('use_sliding_window', False)))
+        self.sliding_window = (int(d['sliding_window'])
+                               if sliding and d.get('sliding_window') else None)
         self.bos_id = d.get('bos_token_id')
         eos = d.get('eos_token_id')
         self.eos_ids = set(eos if isinstance(eos, list) else
@@ -108,6 +129,12 @@ class LlamaConfig(object):
         H, I = self.hidden, self.inter
         per = (H * (self.q_dim + 2 * self.kv_dim) + self.q_dim * H
                + 3 * H * I + 2 * H)
+        if self.qkv_bias:
+            per += self.q_dim + 2 * self.kv_dim
+        if self.o_bias:
+            per += H
+        if self.mlp_bias:
+            per += 2 * I + H
         emb = self.vocab * H * (1 if self.tied else 2)
         return self.n_layer * per + emb + H
 
@@ -115,11 +142,12 @@ class LlamaConfig(object):
         return 2 * self.n_layer * self.kv_dim * ctx * 4
 
     def describe(self):
-        return ('%d layers, hidden %d, %d heads / %d kv heads x %d, mlp %d, '
-                'vocab %d, rope theta %g%s'
-                % (self.n_layer, self.hidden, self.n_head, self.n_kv,
-                   self.head_dim, self.inter, self.vocab, self.theta,
-                   ', tied embeddings' if self.tied else ''))
+        return ('%s: %d layers, hidden %d, %d heads / %d kv heads x %d, '
+                'mlp %d, vocab %d, rope theta %g%s%s'
+                % (self.model_type, self.n_layer, self.hidden, self.n_head,
+                   self.n_kv, self.head_dim, self.inter, self.vocab,
+                   self.theta, ', tied embeddings' if self.tied else '',
+                   ', q/k/v bias' if self.qkv_bias else ''))
 
 
 def rope_inv_freq(cfg):
@@ -475,7 +503,8 @@ class LlamaModel(object):
             raise ValueError("weights must be 'float32' or 'lowmem'")
         self.cfg = cfg
         self.weights = weights
-        self.ctx_limit = int(min(ctx_limit, cfg.max_pos))
+        self.ctx_limit = int(min(ctx_limit, cfg.max_pos,
+                                 cfg.sliding_window or cfg.max_pos))
         self.mv = MatVec(matvec)
         self.ckpt = ckpt
         scratch = None
@@ -520,9 +549,9 @@ class LlamaModel(object):
                          (a + 'k_proj.weight', (kvd, H)),
                          (a + 'v_proj.weight', (kvd, H))],
                         [a + 'q_proj.bias', a + 'k_proj.bias',
-                         a + 'v_proj.bias'] if cfg.attn_bias else None)
+                         a + 'v_proj.bias'] if cfg.qkv_bias else None)
             L.o = lin([(a + 'o_proj.weight', (H, qd))],
-                      [a + 'o_proj.bias'] if cfg.attn_bias else None)
+                      [a + 'o_proj.bias'] if cfg.o_bias else None)
             L.gate_up = lin([(m + 'gate_proj.weight', (I, H)),
                              (m + 'up_proj.weight', (I, H))],
                             [m + 'gate_proj.bias', m + 'up_proj.bias']
@@ -566,7 +595,8 @@ class LlamaModel(object):
         # file's pages then sit in the OS cache, which is not charged to
         # this process, instead of being mapped into it. On iOS mapped
         # pages stayed resident and added ~300 MB to the load peak.
-        ckpt = Checkpoint(path, use_mmap=kw.get('weights') == 'lowmem')
+        ckpt = Checkpoint(path, use_mmap='require'
+                          if kw.get('weights') == 'lowmem' else False)
         try:
             return cls(cfg, ckpt, **kw)
         except BaseException:

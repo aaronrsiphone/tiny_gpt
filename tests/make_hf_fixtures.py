@@ -5,9 +5,11 @@ Hugging Face libraries. The tests themselves need only NumPy; this script
 is the one place the reference implementations are used:
 
     pip install torch transformers tokenizers safetensors
-    python tests/make_hf_fixtures.py [path/to/SmolLM2-135M-Instruct]
+    python tests/make_hf_fixtures.py [SmolLM2-135M-Instruct dir
+                                      [Qwen2.5-Coder-1.5B dir
+                                       [Qwen2.5-Coder-1.5B-Instruct dir]]]
 
-Without a model directory only the synthetic fixtures are rebuilt.
+Without model directories only the synthetic fixtures are rebuilt.
 
 Fixtures, all JSON (weights base64-encoded) so they need neither git-lfs
 nor the *.npz/*.safetensors patterns this repo ignores or LFS-tracks:
@@ -19,8 +21,18 @@ nor the *.npz/*.safetensors patterns this repo ignores or LFS-tracks:
   bpe_tiny.json       a small byte-level BPE trained by `tokenizers` with
                       SmolLM2's pipeline (Digits + ByteLevel), plus
                       reference encodings
+  bpe_tiny_qwen.json  the same with Qwen2's pipeline (NFC, Split regex,
+                      ByteLevel without its own regex)
+  tiny_qwen2_bf16.json a random tiny Qwen2 (q/k/v bias) with logits
   smollm2_tokens.json SmolLM2 encodings and chat-template renderings
   smollm2_logits.json SmolLM2 float32 reference logits / greedy decode
+  qwen_tokens.json,   the same for Qwen2.5-Coder-1.5B
+  qwen_logits.json
+  qwen_instruct_chat.json  Qwen2.5-Coder-1.5B-Instruct answering a chat
+                      message, greedy with its repetition penalty
+  chat_templates.json real chat templates from several model repos,
+                      rendered by transformers' own renderer (fetches the
+                      templates from the Hub; skipped when offline)
 '''
 
 import base64
@@ -90,14 +102,18 @@ def readme_text():
 
 # ------------------------------------------------------------ tiny llama
 
-def tiny_llama(name, cfg_kw, dtype, seed, seq_len=24):
+def tiny_llama(name, cfg_kw, dtype, seed, seq_len=24, kind='llama'):
     import torch
     from safetensors.torch import save
-    from transformers import LlamaConfig, LlamaForCausalLM
+    import transformers
+    Config, Model = {
+        'llama': (transformers.LlamaConfig, transformers.LlamaForCausalLM),
+        'qwen2': (transformers.Qwen2Config, transformers.Qwen2ForCausalLM),
+    }[kind]
 
     torch.manual_seed(seed)
-    cfg = LlamaConfig(**cfg_kw)
-    model = LlamaForCausalLM(cfg).eval()
+    cfg = Config(**cfg_kw)
+    model = Model(cfg).eval()
     with torch.no_grad():
         for p in model.parameters():
             p.normal_(0, 0.3)
@@ -176,6 +192,110 @@ def chat_ids(at, msgs):
     return [int(i) for i in ids]
 
 
+QWEN_SPLIT = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}"
+              r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
+
+NFC_TEXTS = ['é café Å Å 각',
+             "I'M HE'LL She'S it'Ll ſ 'ſ 'K",
+             'x̣́ x̣́ क़ ﬁ ①',
+             'a࣍́ á࣍ ᫁é',
+             'def f(x):\r\n    return x  # été\n\n\n']
+
+
+def bpe_tiny_qwen():
+    from tokenizers import (Regex, Tokenizer, decoders, models, normalizers,
+                            pre_tokenizers, trainers)
+    tok = Tokenizer(models.BPE())
+    tok.normalizer = normalizers.NFC()
+    tok.pre_tokenizer = pre_tokenizers.Sequence([
+        pre_tokenizers.Split(Regex(QWEN_SPLIT), behavior='isolated'),
+        pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)])
+    tok.decoder = decoders.ByteLevel()
+    tr = trainers.BpeTrainer(
+        vocab_size=700, special_tokens=['<|endoftext|>', '<|im_start|>',
+                                        '<|im_end|>'],
+        initial_alphabet=pre_tokenizers.ByteLevel.alphabet())
+    tok.train_from_iterator([readme_text()] * 2 + TEXTS + NFC_TEXTS,
+                            trainer=tr)
+    spec = json.loads(tok.to_str())
+    texts = TEXTS + NFC_TEXTS + random_texts(300, seed=3)
+    dump('bpe_tiny_qwen.json', {
+        'tokenizer': spec, 'texts': texts,
+        'ids': [tok.encode(t).ids for t in texts],
+        'decoded': [tok.decode(tok.encode(t).ids, skip_special_tokens=False)
+                    for t in texts]})
+
+
+CODE_PROMPT = ('def quicksort(arr):\n'
+               '    """Sort a list of numbers in ascending order."""\n')
+
+
+def qwen_tokens(model_dir):
+    from tokenizers import Tokenizer
+    ref = Tokenizer.from_file(os.path.join(model_dir, 'tokenizer.json'))
+    texts = TEXTS + NFC_TEXTS + random_texts(500, seed=4)
+    for f in ('make_hf_fixtures.py', 'hf_common.py'):
+        with open(os.path.join(HERE, f), 'rb') as fh:
+            texts.append(fh.read().decode('utf-8'))
+    dump('qwen_tokens.json', {'texts': texts,
+                              'ids': [ref.encode(t).ids for t in texts]})
+
+
+def qwen_logits(model_dir):
+    import torch
+    from tokenizers import Tokenizer
+    from transformers import AutoModelForCausalLM
+    ref = Tokenizer.from_file(os.path.join(model_dir, 'tokenizer.json'))
+    ids = ref.encode(CODE_PROMPT).ids
+    model = AutoModelForCausalLM.from_pretrained(
+        model_dir, dtype=torch.float32).eval()
+    x = torch.tensor([ids])
+    with torch.no_grad():
+        logits = model(x).logits[0].numpy()
+        gen = model.generate(x, max_new_tokens=40, do_sample=False,
+                             eos_token_id=151643,
+                             pad_token_id=151643)[0].tolist()
+    sel = list(range(0, logits.shape[1], 211))
+    dump('qwen_logits.json', {
+        'prompt': CODE_PROMPT, 'ids': ids, 'logits_cols': sel,
+        'logits_sel': b64(np.ascontiguousarray(
+            logits[:, sel], dtype=np.float32).tobytes()),
+        'last_logits': b64(logits[-1].astype(np.float32).tobytes()),
+        'greedy': gen[len(ids):], 'greedy_text': ref.decode(gen[len(ids):]),
+    })
+
+
+COUNT_WORDS = (
+    'Write a Python function called `count_words` that takes a string and '
+    'returns a dictionary mapping each word to how many times it appears.'
+    '\n\nRules:\n- Treat words case-insensitively ("The" and "the" are the '
+    'same word).\n- Ignore punctuation: . , ! ? ; :\n- Split on whitespace.'
+    '\n- Use only the Python standard library.\n\nExample:\n'
+    'count_words("The cat sat. The cat ran!")\nshould return:\n'
+    '{"the": 2, "cat": 2, "sat": 1, "ran": 1}\n\n'
+    'Return only the code, with no explanation.')
+
+
+def qwen_instruct_chat(model_dir):
+    # Greedy decoding with the model's own repetition_penalty (1.1, from
+    # its generation_config.json), which transformers applies even when
+    # not sampling.
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    at = AutoTokenizer.from_pretrained(model_dir)
+    msgs = [{'role': 'user', 'content': COUNT_WORDS}]
+    ids = chat_ids(at, msgs)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_dir, dtype=torch.float32).eval()
+    with torch.no_grad():
+        gen = model.generate(torch.tensor([ids]), max_new_tokens=48,
+                             do_sample=False, repetition_penalty=1.1,
+                             pad_token_id=151643)[0].tolist()
+    dump('qwen_instruct_chat.json', {
+        'messages': msgs, 'ids': ids, 'repetition_penalty': 1.1,
+        'greedy': gen[len(ids):], 'greedy_text': at.decode(gen[len(ids):])})
+
+
 def smollm2_tokens(model_dir):
     from tokenizers import Tokenizer
     from transformers import AutoTokenizer
@@ -230,6 +350,76 @@ def smollm2_logits(model_dir):
     })
 
 
+TEMPLATE_REPOS = ['HuggingFaceTB/SmolLM2-135M-Instruct',
+                  'Qwen/Qwen2.5-0.5B-Instruct', 'Qwen/Qwen3-0.6B',
+                  'HuggingFaceTB/SmolLM3-3B',
+                  'microsoft/Phi-3.5-mini-instruct',
+                  'Qwen/Qwen2.5-Coder-1.5B']
+FIXED_NOW = (2026, 1, 15, 9, 30)       # templates that print today's date
+
+
+def chat_templates():
+    import datetime
+    from huggingface_hub import hf_hub_download
+    import transformers.utils.chat_template_utils as ctu
+
+    class FixedClock(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.datetime(*FIXED_NOW)
+    ctu.datetime = FixedClock
+
+    def text(v):
+        return v.get('content') if isinstance(v, dict) else v
+
+    convs = [
+        ([{'role': 'user', 'content': 'What is 2+2?'}], {}),
+        ([{'role': 'system', 'content': 'Answer in French.'},
+          {'role': 'user', 'content': 'Hello!'}], {}),
+        ([{'role': 'user', 'content': 'Name a colour.'},
+          {'role': 'assistant', 'content': 'Blue.'},
+          {'role': 'user', 'content': 'Another, with an emoji \U0001F308'}],
+         {}),
+        ([{'role': 'user', 'content': 'Think briefly: 3*7?'}],
+         {'enable_thinking': False}),
+    ]
+    out = {}
+    for repo in TEMPLATE_REPOS:
+        try:
+            cfg_path = hf_hub_download(repo, 'tokenizer_config.json')
+        except Exception as e:
+            print('skipping chat templates (%s)' % e.__class__.__name__)
+            return
+        with open(cfg_path, 'rb') as f:
+            cfg = json.loads(f.read().decode('utf-8'))
+        tpl = cfg.get('chat_template')
+        try:
+            with open(hf_hub_download(repo, 'chat_template.jinja'),
+                      'rb') as f:
+                tpl = f.read().decode('utf-8')
+        except Exception:
+            pass
+        if isinstance(tpl, list):
+            tpl = dict((t['name'], t['template']) for t in tpl)['default']
+        special = {k: text(cfg[k]) for k in ('bos_token', 'eos_token',
+                                              'unk_token', 'pad_token')
+                   if text(cfg.get(k))}
+        if cfg.get('additional_special_tokens'):
+            special['additional_special_tokens'] = [
+                text(t) for t in cfg['additional_special_tokens']]
+        cases = []
+        for msgs, kw in convs:
+            for agp in (True, False):
+                r, _ = ctu.render_jinja_template(
+                    [msgs], chat_template=tpl, add_generation_prompt=agp,
+                    **dict(special, **kw))
+                cases.append({'messages': msgs, 'kwargs': kw,
+                              'add_generation_prompt': agp, 'text': r[0]})
+        out[repo] = {'template': tpl, 'special_tokens': special,
+                     'cases': cases}
+    dump('chat_templates.json', {'now': list(FIXED_NOW), 'repos': out})
+
+
 def main():
     os.makedirs(FIX, exist_ok=True)
     safetensors_dtypes()
@@ -251,10 +441,21 @@ def main():
     tiny_llama('tiny_llama_mha_f32.json',
                dict(base, tie_word_embeddings=True, num_key_value_heads=6,
                     rope_theta=10000.0), 'F32', seed=3, seq_len=70)
+    tiny_llama('tiny_qwen2_bf16.json',
+               dict(base, tie_word_embeddings=True, rope_theta=1000000.0,
+                    rms_norm_eps=1e-6, use_sliding_window=False),
+               'BF16', seed=4, kind='qwen2')
     bpe_tiny()
+    bpe_tiny_qwen()
+    chat_templates()
     if len(sys.argv) > 1:
         smollm2_tokens(sys.argv[1])
         smollm2_logits(sys.argv[1])
+    if len(sys.argv) > 2:
+        qwen_tokens(sys.argv[2])
+        qwen_logits(sys.argv[2])
+    if len(sys.argv) > 3:
+        qwen_instruct_chat(sys.argv[3])
 
 
 if __name__ == '__main__':

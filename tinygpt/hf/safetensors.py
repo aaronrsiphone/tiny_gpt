@@ -133,7 +133,13 @@ def parse_header(blob, data_len, path='<buffer>'):
 
 
 class SafeTensorsFile(object):
-    '''One .safetensors file, memory-mapped read-only.'''
+    '''One .safetensors file, memory-mapped read-only.
+
+    use_mmap: True maps the file and falls back to reading tensors one by
+    one if mapping fails; 'require' raises instead (lowmem mode, where a
+    silent fallback would pull the whole model into RAM); False never
+    maps.
+    '''
 
     def __init__(self, path, use_mmap=True):
         self.path = path
@@ -148,7 +154,13 @@ class SafeTensorsFile(object):
             try:
                 self._mm = mmap.mmap(self._f.fileno(), 0,
                                      access=mmap.ACCESS_READ)
-            except (OSError, ValueError):
+            except (OSError, ValueError) as e:
+                if use_mmap == 'require':
+                    self.close()
+                    raise SafetensorsError(
+                        '%s: could not memory-map the %d MB file (%s); '
+                        'lowmem mode needs a memory map'
+                        % (path, self._size >> 20, e))
                 self._mm = None   # fall back to seek+read per tensor
 
     def _open(self):

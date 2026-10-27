@@ -16,6 +16,7 @@ same settings are command-line options:
     python hf_run.py info                           what is cached
 
     options: --model ID  --max-new N  --temp T  --top-k K  --top-p P
+             --rep-penalty R
              --ctx N  --weights float32|lowmem  --seed S  --system TEXT
              --cache DIR  --report FILE
 
@@ -34,17 +35,22 @@ import time
 # ============================================================== settings
 # Edit these when running from Pythonista (no command-line arguments).
 
-MODEL_ID = 'HuggingFaceTB/SmolLM2-135M-Instruct'
+MODEL_ID = 'HuggingFaceTB/SmolLM2-135M-Instruct'   # or a huggingface.co URL
 MODE = 'chat'           # download | chat | ask | complete | import |
                         # bench | selftest | info
 PROMPT = 'What is the capital of France?'   # for ask / complete
 MAX_NEW_TOKENS = 256
-TEMPERATURE = 0.2       # 0 = greedy (deterministic)
-TOP_K = 0               # 0 = off
-TOP_P = 0.9             # 1.0 = off
+# Sampling. None = what the model recommends in its generation_config.json
+# (as transformers would use), else temperature 0.2 / top-p 0.9.
+TEMPERATURE = None      # 0 = greedy (deterministic)
+TOP_K = None            # 0 = off
+TOP_P = None            # 1.0 = off
+REPETITION_PENALTY = None   # 1.0 = off
 CONTEXT_LIMIT = 1024    # tokens of KV cache; ~7 MB per 100 for SmolLM2-135M
-WEIGHTS = 'float32'     # 'float32' (fast, ~540 MB) or 'lowmem' (~30 MB of
-                        # weights resident + the OS file cache; slower)
+WEIGHTS = 'auto'        # 'auto': float32 for small models, lowmem otherwise
+                        # 'float32': widened once at load, 4 bytes/param
+                        # 'lowmem': weights stay in the file (~0 MB counted
+                        #           against the app), widened as used
 SYSTEM_PROMPT = None    # None = the model's own default
 SEED = 0
 CACHE_DIR = None        # None = hf_models/ next to this script
@@ -71,8 +77,9 @@ def settings_from_argv(argv):
     p.add_argument('--temp', type=float, default=TEMPERATURE)
     p.add_argument('--top-k', type=int, default=TOP_K)
     p.add_argument('--top-p', type=float, default=TOP_P)
+    p.add_argument('--rep-penalty', type=float, default=REPETITION_PENALTY)
     p.add_argument('--ctx', type=int, default=CONTEXT_LIMIT)
-    p.add_argument('--weights', choices=['float32', 'lowmem'],
+    p.add_argument('--weights', choices=['auto', 'float32', 'lowmem'],
                    default=WEIGHTS)
     p.add_argument('--seed', type=int, default=SEED)
     p.add_argument('--system', default=SYSTEM_PROMPT)
@@ -83,6 +90,7 @@ def settings_from_argv(argv):
     return {
         'mode': a.mode, 'model': a.model, 'max_new': a.max_new,
         'temp': a.temp, 'top_k': a.top_k, 'top_p': a.top_p, 'ctx': a.ctx,
+        'rep': a.rep_penalty,
         'weights': a.weights, 'seed': a.seed, 'system': a.system,
         'cache': a.cache, 'revision': a.revision, 'report': a.report,
         'prompt': a.text if a.mode in ('ask', 'complete') else PROMPT,
@@ -94,6 +102,7 @@ def settings_from_globals():
     return {
         'mode': MODE, 'model': MODEL_ID, 'max_new': MAX_NEW_TOKENS,
         'temp': TEMPERATURE, 'top_k': TOP_K, 'top_p': TOP_P,
+        'rep': REPETITION_PENALTY,
         'ctx': CONTEXT_LIMIT, 'weights': WEIGHTS, 'seed': SEED,
         'system': SYSTEM_PROMPT, 'cache': CACHE_DIR, 'revision': 'main',
         'report': REPORT_FILE, 'prompt': PROMPT, 'source': IMPORT_SOURCE,
@@ -212,9 +221,26 @@ def locate(s):
         % s['model'])
 
 
+# 'auto' picks float32 up to this many MB of float32 weights. Measured on
+# an iPhone: float32 decoded 1.5x faster than lowmem at 135M params (540
+# MB), and no faster at 360M (1.45 GB) while using ~1.8 GB more memory.
+AUTO_FLOAT32_MAX_MB = 1000
+# Explicit float32 above this is refused on iOS: the system would kill
+# Pythonista without any Python-level MemoryError.
+IOS_FLOAT32_MAX_MB = 2500
+
+
+def resolve_weights(mode, cfg):
+    if mode != 'auto':
+        return mode
+    return 'float32' if cfg.n_params() * 4 <= AUTO_FLOAT32_MAX_MB << 20 \
+        else 'lowmem'
+
+
 def load(s, quiet=False):
     from tinygpt import backend
     from tinygpt.hf.llama import LlamaModel, UnsupportedModel
+    from tinygpt.hf.safetensors import SafetensorsError
     from tinygpt.hf.tokenizer import BPETokenizer, ChatFormat
     import json
     path = locate(s)
@@ -225,19 +251,26 @@ def load(s, quiet=False):
         cfg = LlamaConfig(raw_cfg)
     except UnsupportedModel as e:
         raise SystemExit('unsupported model: %s' % e)
-    ctx = min(s['ctx'], cfg.max_pos)
-    est = (cfg.n_params() * 4 if s['weights'] == 'float32' else 8 << 20) \
+    ctx = min(s['ctx'], cfg.max_pos, cfg.sliding_window or cfg.max_pos)
+    weights = resolve_weights(s['weights'], cfg)
+    est = (cfg.n_params() * 4 if weights == 'float32' else 8 << 20) \
         + cfg.kv_bytes(ctx)
+    if (weights == 'float32' and sys.platform == 'ios'
+            and est > IOS_FLOAT32_MAX_MB << 20):
+        raise SystemExit(
+            'float32 weights for this model need about %d MB, more than '
+            'iOS lets Pythonista use. Use WEIGHTS = "lowmem" (or "auto").'
+            % (est >> 20))
     if not quiet:
         print('%s  (%s params)' % (s['model'], '{:,}'.format(cfg.n_params())))
         print(cfg.describe())
-        print('weights %s, context %d, needs about %d MB; Accelerate %s'
-              % (s['weights'], ctx, est >> 20,
+        print('weights %s%s, context %d, needs about %d MB; Accelerate %s'
+              % (weights, ' (auto)' if s['weights'] == 'auto' else '', ctx,
+                 est >> 20,
                  'yes' if backend.HAVE_ACCELERATE else 'no (NumPy only)'))
     t0 = time.time()
     try:
-        model = LlamaModel.from_dir(path, ctx_limit=ctx,
-                                    weights=s['weights'])
+        model = LlamaModel.from_dir(path, ctx_limit=ctx, weights=weights)
     except MemoryError:
         raise SystemExit(
             'out of memory loading the weights (needs about %d MB).\n'
@@ -245,31 +278,105 @@ def load(s, quiet=False):
             % (est >> 20))
     except UnsupportedModel as e:
         raise SystemExit('unsupported model: %s' % e)
+    except SafetensorsError as e:
+        raise SystemExit('cannot load the weights: %s' % e)
     t_load = time.time() - t0
     tok = BPETokenizer.from_dir(path)
     try:
-        chat = ChatFormat(tok.chat_template)
-    except ValueError:
+        chat = ChatFormat(tok.chat_template, tok.special_tokens)
+    except ValueError as e:
         chat = None
+        chat_note = str(e)
+    else:
+        chat_note = {'jinja2': "the model's template (jinja2)",
+                     'chatml': 'built-in ChatML (no jinja2)'}[chat.engine]
     stops = set(cfg.eos_ids)
+    model.generation_config = {}
     gen_cfg = os.path.join(path, 'generation_config.json')
     if os.path.exists(gen_cfg):
         with open(gen_cfg, 'rb') as f:
-            e = json.loads(f.read().decode('utf-8')).get('eos_token_id')
+            model.generation_config = json.loads(f.read().decode('utf-8'))
+        e = model.generation_config.get('eos_token_id')
         stops.update(e if isinstance(e, list) else ([e] if e is not None
                                                     else []))
     if tok.eos_id is not None:
         stops.add(tok.eos_id)
+    # A ChatML turn ends at <|im_end|>. Instruct models declare it as an
+    # end token; base models (Qwen2.5-Coder-1.5B) do not, which is how a
+    # base model in chat mode is recognised. It may still emit it.
+    model.base_model_chat = False
+    if chat is not None and '<|im_end|>' in (tok.chat_template or ''):
+        if '<|im_end|>' in tok.token_to_id:
+            end = tok.token_to_id['<|im_end|>']
+            model.base_model_chat = end not in stops
+            stops.add(end)
     if not quiet:
         pk = peak_rss_mb()
         print('loaded in %.1fs, memory now %s (peak so far %s MB)'
               % (t_load, memory_line(), '%.0f' % pk if pk else '?'))
+        print('chat format: %s' % chat_note)
     return model, tok, chat, stops, t_load
 
 
-def make_sampler(s):
+# Used when neither the settings nor generation_config.json say otherwise.
+DEFAULT_SAMPLING = {'temperature': 0.2, 'top_k': 0, 'top_p': 0.9,
+                    'repetition_penalty': 1.0}
+
+
+def sampling_settings(s, gen):
+    '''Resolve sampling parameters: explicit settings, then the model's
+    generation_config.json (`gen`), then DEFAULT_SAMPLING.
+
+    Follows transformers: a config with do_sample true samples with its
+    temperature/top_k/top_p (transformers' own defaults 1.0/50/1.0 for any
+    it leaves out), do_sample false means greedy, and repetition_penalty
+    applies either way. Returns (dict, where each value came from).
+    '''
+    out = dict(DEFAULT_SAMPLING)
+    src = 'defaults'
+    if gen.get('do_sample') is True:
+        out.update(temperature=float(gen.get('temperature', 1.0)),
+                   top_k=int(gen.get('top_k', 50)),
+                   top_p=float(gen.get('top_p', 1.0)))
+        src = 'generation_config.json'
+    elif gen.get('do_sample') is False:
+        out.update(temperature=0.0)
+        src = 'generation_config.json'
+    if 'repetition_penalty' in gen:
+        out['repetition_penalty'] = float(gen['repetition_penalty'])
+        src = 'generation_config.json'
+    explicit = False
+    for key, name in (('temp', 'temperature'), ('top_k', 'top_k'),
+                      ('top_p', 'top_p'), ('rep', 'repetition_penalty')):
+        if s.get(key) is not None:
+            out[name] = s[key]
+            explicit = True
+    if explicit:
+        src = 'settings' if src == 'defaults' else src + ' + settings'
+    return out, src
+
+
+def make_sampler(s, model=None):
     from tinygpt.hf.llama import Sampler
-    return Sampler(s['temp'], s['top_k'], s['top_p'], seed=s['seed'])
+    gen = getattr(model, 'generation_config', None) or {}
+    p, src = sampling_settings(s, gen)
+    print('sampling: %s (%s)' % (
+        'greedy' if p['temperature'] <= 0 else
+        'temperature %g, top_k %d, top_p %g' % (p['temperature'], p['top_k'],
+                                               p['top_p'])
+        + ('' if p['repetition_penalty'] == 1.0 else
+           ', repetition penalty %g' % p['repetition_penalty']), src))
+    return Sampler(p['temperature'], p['top_k'], p['top_p'],
+                   p['repetition_penalty'], seed=s['seed'])
+
+
+def warn_base_model(model, s):
+    if getattr(model, 'base_model_chat', False):
+        print('note: %s looks like a base model -- its config does not end '
+              'turns at <|im_end|> -- so it will tend to continue the text '
+              'rather than answer. Use MODE = "complete", or the chat '
+              'version of the model (often named ...-Instruct).'
+              % s['model'])
 
 
 def run_generation(model, tok, cache, ids, s, stops, sampler):
@@ -351,11 +458,12 @@ def mode_ask(s, raw=False):
         ids = tok.encode(s['prompt'])
         sys.stdout.write(s['prompt'])
     else:
+        warn_base_model(model, s)
         ids = tok.encode(chat.render(messages_for(
             s, [{'role': 'user', 'content': s['prompt']}])))
         print('\n> %s\n' % s['prompt'])
     run_generation(model, tok, model.new_cache(), ids, s, stops,
-                   make_sampler(s))
+                   make_sampler(s, model))
 
 
 def mode_chat(s):
@@ -364,8 +472,9 @@ def mode_chat(s):
         raise SystemExit('this model has no chat template; use complete')
     print('\nchat with %s -- empty line or /quit to stop, /reset to clear'
           % s['model'].split('/')[-1])
+    warn_base_model(model, s)
     cache = model.new_cache()
-    sampler = make_sampler(s)
+    sampler = make_sampler(s, model)
     history = []
     while True:
         try:
@@ -381,7 +490,12 @@ def mode_chat(s):
             print('(cleared)')
             continue
         history.append({'role': 'user', 'content': line})
-        ids, history = fit_history(model, tok, chat, s, history)
+        try:
+            ids, history = fit_history(model, tok, chat, s, history)
+        except ValueError as e:      # the template rejected the messages
+            print(e)
+            history.pop()
+            continue
         sys.stdout.write('\nbot> ')
         out, _ = run_generation(model, tok, cache, ids, s, stops, sampler)
         history.append({'role': 'assistant',
@@ -397,14 +511,14 @@ def bench(s, out=print):
     mem0 = memory_line()
     model, tok, chat, stops, t_load = load(s, quiet=True)
     mem1 = memory_line()
-    out('model        %s (%s)' % (s['model'], s['weights']))
+    out('model        %s (%s)' % (s['model'], model.weights))
     out('platform     %s, python %s, numpy %s'
         % (sys.platform, sys.version.split()[0], __import__('numpy')
            .__version__))
     out('accelerate   %s (sgemv %s)' % (backend.HAVE_ACCELERATE,
                                        backend.HAVE_SGEMV))
     out('load         %.2f s' % t_load)
-    if s['weights'] == 'float32':
+    if model.weights == 'float32':
         out('backend choice per weight shape (timed at load):')
         out(model.mv.report())
     prompt = chat.render([{'role': 'user', 'content':
@@ -484,13 +598,18 @@ def mode_selftest(s):
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     s = settings_from_argv(argv) if argv else settings_from_globals()
+    from tinygpt.hf import hub
+    s['model'] = hub.normalize_repo_id(s['model'])
     fn = {'download': mode_download, 'import': mode_import,
           'info': mode_info, 'chat': mode_chat,
           'ask': mode_ask, 'complete': lambda s: mode_ask(s, raw=True),
           'bench': mode_bench, 'selftest': mode_selftest}.get(s['mode'])
     if fn is None:
         raise SystemExit('unknown MODE %r' % s['mode'])
-    fn(s)
+    try:
+        fn(s)
+    except hub.HubError as e:
+        raise SystemExit('error: %s' % e)
 
 
 if __name__ == '__main__':

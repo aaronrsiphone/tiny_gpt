@@ -503,12 +503,35 @@ it only knows the language its corpus is generated in.
 
 ## 5. Run a pretrained Hugging Face model
 
-`hf_run.py` downloads a pretrained Llama-architecture model straight from
-the Hugging Face Hub and runs it entirely on-device, on NumPy and Accelerate.
-There's no inference API, no PyTorch and no `transformers`. The first target
-is [HuggingFaceTB/SmolLM2-135M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct).
-This is inference only. Nothing is trained, and the training code above is
-untouched.
+`hf_run.py` downloads a pretrained model straight from the Hugging Face Hub
+and runs it entirely on-device, on NumPy and Accelerate. There's no
+inference API, no PyTorch and no `transformers`. This is inference only.
+Nothing is trained, and the training code above is untouched.
+
+Verified against `transformers` (exact tokenization, matching logits,
+identical greedy output):
+
+| Model | Architecture | Weights mode | iPhone decode |
+|-------|--------------|--------------|---------------|
+| [HuggingFaceTB/SmolLM2-135M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct) | Llama | float32 | ~78 tok/s |
+| [HuggingFaceTB/SmolLM2-360M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct) | Llama | lowmem | ~21 tok/s (same tokenizer and template as 135M; logits not separately checked) |
+| [Qwen/Qwen2.5-Coder-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct) | Qwen2 | lowmem | not yet measured |
+| [Qwen/Qwen2.5-Coder-1.5B](https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B) | Qwen2 | lowmem | not yet measured |
+
+Other models with these architectures and a byte-level BPE tokenizer
+should work too. For chat, use an instruct model. Base models such as
+Qwen2.5-Coder-1.5B were trained only to continue text: in chat mode they
+echo the message back (transformers does exactly the same), and
+`hf_run.py` warns about this. Use them with `MODE = 'complete'` and the
+start of some code as the prompt.
+
+Sampling follows the model's own `generation_config.json`, as transformers
+does. For example, Qwen2.5-Coder-Instruct uses temperature 0.7, top-k 20,
+top-p 0.8 and repetition penalty 1.1, which transformers applies even when
+decoding greedily. Setting `TEMPERATURE`, `TOP_K`, `TOP_P` or
+`REPETITION_PENALTY` overrides it. Without a recommendation the defaults
+are temperature 0.2 and top-p 0.9.
+`MODEL_ID` also accepts a model's huggingface.co URL.
 
 ### In Pythonista
 
@@ -557,9 +580,9 @@ The capital of France is Paris.
 |------|----------|
 | `hub.py` | Downloader using `requests` + stdlib. One call to the Hub's revision API, then streamed downloads with progress, HTTP Range resume, retries, and SHA-256 (LFS) / git SHA-1 checks. A snapshot cache works offline. Only an allowlist of files is fetched (config, tokenizer, safetensors). Paths are validated, and repos offering only pickled `*.bin`/`*.pt` weights are refused. |
 | `safetensors.py` | Pure-Python reader (struct + json + mmap). Tensors are zero-copy views onto the mapped file. Every offset, length, shape and dtype is validated before bytes are read. Handles F32, F16 and BF16 (an exact 16-bit shift), plus sharded checkpoints through `model.safetensors.index.json`. |
-| `tokenizer.py` | Byte-level BPE from `tokenizer.json`: added/special tokens, the Digits + GPT-2-regex pre-tokenizer, and the same priority-queue merge order as the Rust library. Includes a streaming UTF-8 decoder and ChatML formatting. Configurations it doesn't implement exactly are refused at load. |
-| `unicode_tables.py` | `\p{L}`, `\p{N}`, `\s` and Rust `is_numeric` as codepoint ranges, measured from the reference `tokenizers` library (`tools/gen_unicode_tables.py`). This keeps tokenization from drifting with Pythonista's older Unicode database. |
-| `llama.py` | The model: RMSNorm, rotate-half RoPE (including `linear`/`llama3` scaling), grouped-query attention, a preallocated KV cache, SwiGLU, and tied or untied heads. All dimensions come from `config.json`, in either the transformers 4 or 5 layout. Prompts are prefilled with matrix-matrix products and decoding uses matrix-vector products. Also contains the sampler (greedy, temperature, top-k, top-p, repetition penalty). |
+| `tokenizer.py` | Byte-level BPE from `tokenizer.json`: added/special tokens, NFC normalization, the Digits, Split (regex translated to Python's `re`) and ByteLevel pre-tokenizers, and the same priority-queue merge order as the Rust library. Includes a streaming UTF-8 decoder and the chat template, rendered in Jinja2's sandbox exactly as transformers does it. Configurations it doesn't implement exactly are refused at load. |
+| `unicode_tables.py` | `\p{L}`, `\p{N}`, `\s` and Rust `is_numeric` as codepoint ranges, measured from the reference `tokenizers` library (`tools/gen_unicode_tables.py`). It also lists the combining marks that library's older NFC tables leave alone. This keeps tokenization from drifting with Pythonista's Unicode database. |
+| `llama.py` | The model (Llama and Qwen2): RMSNorm, rotate-half RoPE (including `linear`/`llama3` scaling), grouped-query attention, a preallocated KV cache, SwiGLU, tied or untied heads, and per-projection biases (Qwen2's q/k/v). All dimensions come from `config.json`, in either the transformers 4 or 5 layout. Prompts are prefilled with matrix-matrix products and decoding uses matrix-vector products. Also contains the sampler (greedy, temperature, top-k, top-p, repetition penalty). |
 
 Design points:
 
@@ -573,13 +596,20 @@ Design points:
   checked against NumPy before it may win. `bench` prints the table.
   `TINY_GPT_MATVEC` / `TINY_GPT_MATMUL` force a choice for A/B runs.
   `backend.py` gained a `gemv()` wrapper; `gemm()` is unchanged.
-- **Two weight modes.** `float32` reads each tensor with a plain file read
+- **Two weight modes, picked automatically.** `WEIGHTS = 'auto'` uses
+  float32 up to ~1 GB of float32 weights and lowmem above that. On an
+  iPhone, float32 was 1.5x faster at 135M params and no faster at 360M,
+  while using 1.8 GB more memory. Explicit float32 is refused on iOS when
+  it would need over 2.5 GB, because iOS kills the app without any Python
+  error. `float32` reads each tensor with a plain file read
   (no memory map, so no BF16 pages stay mapped into the process) and widens
   everything once at load (~540 MB for SmolLM2-135M). `lowmem`
   leaves the weights in the memory-mapped file in their stored dtype and
   widens a slab at a time into an 8 MB scratch buffer. That keeps resident
   weight memory to the OS's clean, droppable file cache, at roughly 1.5x (iPhone) to 4-5x (Linux)
-  slower decoding.
+  slower decoding. Lowmem requires the memory map. If iOS can't map the
+  file, loading fails with a clear error rather than reading gigabytes
+  into RAM.
 - **Chat reuses the KV cache.** Each turn re-renders the conversation, and
   only the tokens after the longest cached prefix are computed. When the
   context limit is reached, the oldest exchanges are dropped.
@@ -593,13 +623,26 @@ against fixtures produced by the official libraries
 
 - **Tokenizer**: ids identical to `tokenizers` on 500+ texts (multilingual,
   emoji/ZWJ, digits, odd whitespace, special tokens, random Unicode) and on
-  all of this README. Chat-template text and ids match
+  a snapshot of this README. Chat-template text and ids match
   `apply_chat_template` exactly.
+- **Chat templates**: the real templates of SmolLM2, SmolLM3, Qwen2.5,
+  Qwen3 and Phi-3.5 render byte-for-byte like transformers' renderer, over
+  40 cases. These include `enable_thinking=False`, a dated system prompt
+  and `{% generation %}`. Templates can't escape the sandbox, and
+  `raise_exception` surfaces as a clear error.
 - **Model**: three tiny random Llamas (GQA and MHA; biases; untied head;
   llama3 RoPE scaling; BF16/F16/F32) match `transformers` float32 logits to
   ~4e-5 in both weight modes. This holds for prefill at several chunk sizes
   and for cached single-token decoding, and the cached path agrees with an
   uncached recompute of every prefix.
+- **Qwen2.5-Coder-1.5B**: tokenizer ids identical to `tokenizers` on
+  4,000+ texts, including combining marks whose NFC handling differs
+  between Unicode versions (checked under Pythonista's Unicode 13 and
+  Python 3.13's 15.1). Logits match `transformers` float32 to ~5e-5, and
+  a 40-token greedy completion is identical. A tiny random Qwen2 matches
+  to ~3e-5 in both weight modes. The Instruct model's chat answer
+  (template, tokenizer, model and repetition penalty together) matches
+  transformers' greedy answer token for token.
 - **SmolLM2-135M-Instruct**: logits match `transformers` float32 to <1e-4
   at every prompt position, and a 48-token greedy decode is token-for-token
   identical. Inference runs with sockets disabled to prove it's offline.
@@ -649,12 +692,16 @@ Pythonista, because its interpreter stays alive between runs.
 
 ### Limitations
 
-- Llama-architecture models only (`LlamaForCausalLM`, SiLU, no
-  `pretraining_tp`). Others fail with a clear `unsupported model` error,
-  as do tokenizers that aren't byte-level BPE (SentencePiece, normalizers,
-  byte fallback).
-- The chat formatter understands ChatML templates (SmolLM2's). It doesn't
-  run arbitrary Jinja.
+- Llama and Qwen2 architectures only (`LlamaForCausalLM`,
+  `Qwen2ForCausalLM`, SiLU, no `pretraining_tp`). Others fail with a clear
+  `unsupported model` error. So do tokenizers that aren't byte-level BPE
+  (SentencePiece, byte fallback) or need a normalizer other than NFC.
+- Qwen2 sliding-window attention isn't implemented. The context limit is
+  capped at the window instead, which is exact, since the window then
+  never takes effect.
+- Chat templates are rendered with jinja2 (Pythonista ships it). Without
+  jinja2, only plain ChatML templates like SmolLM2's work, and others are
+  refused. Tool definitions (`tools=`) aren't passed to templates yet.
 - Float32 compute throughout. Weights stay BF16 only in `lowmem` mode, and
   there's no int8/4-bit quantization.
 - The context is a hard limit (`CONTEXT_LIMIT`, default 1024). Generation
