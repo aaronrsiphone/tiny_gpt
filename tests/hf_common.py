@@ -13,6 +13,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 FIX = os.path.join(HERE, 'fixtures')
 SMOLLM2 = 'HuggingFaceTB/SmolLM2-135M-Instruct'
 QWEN = 'Qwen/Qwen2.5-Coder-1.5B'
+QWEN_INSTRUCT = 'Qwen/Qwen2.5-Coder-1.5B-Instruct'
 
 
 def fixture(name):
@@ -76,3 +77,7 @@ def smollm2_dir():
 
 def qwen_dir():
     return cached(QWEN)
+
+
+def qwen_instruct_dir():
+    return cached(QWEN_INSTRUCT)

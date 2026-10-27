@@ -11,8 +11,8 @@ import unittest
 
 import numpy as np
 
-from tests.hf_common import (b64_array, fixture, qwen_dir, smollm2_dir,
-                             tiny_model_dir)
+from tests.hf_common import (b64_array, fixture, qwen_dir,
+                             qwen_instruct_dir, smollm2_dir, tiny_model_dir)
 from tinygpt.hf.llama import (ContextFull, LlamaConfig, LlamaModel, Sampler,
                               UnsupportedModel, generate)
 
@@ -258,6 +258,32 @@ class QwenTest(unittest.TestCase):
             out, _, _ = generate(self.model, self.model.new_cache(), ids, 12,
                                  Sampler(0.0), stop_ids={151643})
         self.assertEqual(out, d['greedy'][:12])
+
+
+
+@unittest.skipUnless(qwen_instruct_dir(), 'Qwen2.5-Coder-1.5B-Instruct '
+                     'not cached')
+class QwenInstructChatTest(unittest.TestCase):
+    '''A real chat turn: template, tokenizer, model and the repetition
+    penalty together, against transformers' greedy answer.'''
+
+    def test_chat_answer(self):
+        from tinygpt.hf.tokenizer import BPETokenizer, ChatFormat
+        d = fixture('qwen_instruct_chat.json')
+        path = qwen_instruct_dir()
+        tok = BPETokenizer.from_dir(path)
+        cf = ChatFormat(tok.chat_template, tok.special_tokens)
+        ids = tok.encode(cf.render(d['messages']))
+        self.assertEqual(ids, d['ids'])
+        m = LlamaModel.from_dir(path, ctx_limit=256, weights='lowmem')
+        self.addCleanup(m.close)
+        n = 16                       # enough to pass the first repeats
+        with _NoNetwork():
+            out, _, _ = generate(m, m.new_cache(), ids, n,
+                                 Sampler(0.0, repetition_penalty=d[
+                                     'repetition_penalty']),
+                                 stop_ids={151643, 151645})
+        self.assertEqual(out, d['greedy'][:n])
 
 
 if __name__ == '__main__':

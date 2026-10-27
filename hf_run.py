@@ -16,6 +16,7 @@ same settings are command-line options:
     python hf_run.py info                           what is cached
 
     options: --model ID  --max-new N  --temp T  --top-k K  --top-p P
+             --rep-penalty R
              --ctx N  --weights float32|lowmem  --seed S  --system TEXT
              --cache DIR  --report FILE
 
@@ -39,9 +40,12 @@ MODE = 'chat'           # download | chat | ask | complete | import |
                         # bench | selftest | info
 PROMPT = 'What is the capital of France?'   # for ask / complete
 MAX_NEW_TOKENS = 256
-TEMPERATURE = 0.2       # 0 = greedy (deterministic)
-TOP_K = 0               # 0 = off
-TOP_P = 0.9             # 1.0 = off
+# Sampling. None = what the model recommends in its generation_config.json
+# (as transformers would use), else temperature 0.2 / top-p 0.9.
+TEMPERATURE = None      # 0 = greedy (deterministic)
+TOP_K = None            # 0 = off
+TOP_P = None            # 1.0 = off
+REPETITION_PENALTY = None   # 1.0 = off
 CONTEXT_LIMIT = 1024    # tokens of KV cache; ~7 MB per 100 for SmolLM2-135M
 WEIGHTS = 'auto'        # 'auto': float32 for small models, lowmem otherwise
                         # 'float32': widened once at load, 4 bytes/param
@@ -73,6 +77,7 @@ def settings_from_argv(argv):
     p.add_argument('--temp', type=float, default=TEMPERATURE)
     p.add_argument('--top-k', type=int, default=TOP_K)
     p.add_argument('--top-p', type=float, default=TOP_P)
+    p.add_argument('--rep-penalty', type=float, default=REPETITION_PENALTY)
     p.add_argument('--ctx', type=int, default=CONTEXT_LIMIT)
     p.add_argument('--weights', choices=['auto', 'float32', 'lowmem'],
                    default=WEIGHTS)
@@ -85,6 +90,7 @@ def settings_from_argv(argv):
     return {
         'mode': a.mode, 'model': a.model, 'max_new': a.max_new,
         'temp': a.temp, 'top_k': a.top_k, 'top_p': a.top_p, 'ctx': a.ctx,
+        'rep': a.rep_penalty,
         'weights': a.weights, 'seed': a.seed, 'system': a.system,
         'cache': a.cache, 'revision': a.revision, 'report': a.report,
         'prompt': a.text if a.mode in ('ask', 'complete') else PROMPT,
@@ -96,6 +102,7 @@ def settings_from_globals():
     return {
         'mode': MODE, 'model': MODEL_ID, 'max_new': MAX_NEW_TOKENS,
         'temp': TEMPERATURE, 'top_k': TOP_K, 'top_p': TOP_P,
+        'rep': REPETITION_PENALTY,
         'ctx': CONTEXT_LIMIT, 'weights': WEIGHTS, 'seed': SEED,
         'system': SYSTEM_PROMPT, 'cache': CACHE_DIR, 'revision': 'main',
         'report': REPORT_FILE, 'prompt': PROMPT, 'source': IMPORT_SOURCE,
@@ -284,19 +291,25 @@ def load(s, quiet=False):
         chat_note = {'jinja2': "the model's template (jinja2)",
                      'chatml': 'built-in ChatML (no jinja2)'}[chat.engine]
     stops = set(cfg.eos_ids)
+    model.generation_config = {}
     gen_cfg = os.path.join(path, 'generation_config.json')
     if os.path.exists(gen_cfg):
         with open(gen_cfg, 'rb') as f:
-            e = json.loads(f.read().decode('utf-8')).get('eos_token_id')
+            model.generation_config = json.loads(f.read().decode('utf-8'))
+        e = model.generation_config.get('eos_token_id')
         stops.update(e if isinstance(e, list) else ([e] if e is not None
                                                     else []))
     if tok.eos_id is not None:
         stops.add(tok.eos_id)
-    # A ChatML turn ends at <|im_end|>. Instruct models list it as an eos
-    # token; base models (Qwen2.5-Coder) do not, but may still emit it.
+    # A ChatML turn ends at <|im_end|>. Instruct models declare it as an
+    # end token; base models (Qwen2.5-Coder-1.5B) do not, which is how a
+    # base model in chat mode is recognised. It may still emit it.
+    model.base_model_chat = False
     if chat is not None and '<|im_end|>' in (tok.chat_template or ''):
         if '<|im_end|>' in tok.token_to_id:
-            stops.add(tok.token_to_id['<|im_end|>'])
+            end = tok.token_to_id['<|im_end|>']
+            model.base_model_chat = end not in stops
+            stops.add(end)
     if not quiet:
         pk = peak_rss_mb()
         print('loaded in %.1fs, memory now %s (peak so far %s MB)'
@@ -305,9 +318,65 @@ def load(s, quiet=False):
     return model, tok, chat, stops, t_load
 
 
-def make_sampler(s):
+# Used when neither the settings nor generation_config.json say otherwise.
+DEFAULT_SAMPLING = {'temperature': 0.2, 'top_k': 0, 'top_p': 0.9,
+                    'repetition_penalty': 1.0}
+
+
+def sampling_settings(s, gen):
+    '''Resolve sampling parameters: explicit settings, then the model's
+    generation_config.json (`gen`), then DEFAULT_SAMPLING.
+
+    Follows transformers: a config with do_sample true samples with its
+    temperature/top_k/top_p (transformers' own defaults 1.0/50/1.0 for any
+    it leaves out), do_sample false means greedy, and repetition_penalty
+    applies either way. Returns (dict, where each value came from).
+    '''
+    out = dict(DEFAULT_SAMPLING)
+    src = 'defaults'
+    if gen.get('do_sample') is True:
+        out.update(temperature=float(gen.get('temperature', 1.0)),
+                   top_k=int(gen.get('top_k', 50)),
+                   top_p=float(gen.get('top_p', 1.0)))
+        src = 'generation_config.json'
+    elif gen.get('do_sample') is False:
+        out.update(temperature=0.0)
+        src = 'generation_config.json'
+    if 'repetition_penalty' in gen:
+        out['repetition_penalty'] = float(gen['repetition_penalty'])
+        src = 'generation_config.json'
+    explicit = False
+    for key, name in (('temp', 'temperature'), ('top_k', 'top_k'),
+                      ('top_p', 'top_p'), ('rep', 'repetition_penalty')):
+        if s.get(key) is not None:
+            out[name] = s[key]
+            explicit = True
+    if explicit:
+        src = 'settings' if src == 'defaults' else src + ' + settings'
+    return out, src
+
+
+def make_sampler(s, model=None):
     from tinygpt.hf.llama import Sampler
-    return Sampler(s['temp'], s['top_k'], s['top_p'], seed=s['seed'])
+    gen = getattr(model, 'generation_config', None) or {}
+    p, src = sampling_settings(s, gen)
+    print('sampling: %s (%s)' % (
+        'greedy' if p['temperature'] <= 0 else
+        'temperature %g, top_k %d, top_p %g' % (p['temperature'], p['top_k'],
+                                               p['top_p'])
+        + ('' if p['repetition_penalty'] == 1.0 else
+           ', repetition penalty %g' % p['repetition_penalty']), src))
+    return Sampler(p['temperature'], p['top_k'], p['top_p'],
+                   p['repetition_penalty'], seed=s['seed'])
+
+
+def warn_base_model(model, s):
+    if getattr(model, 'base_model_chat', False):
+        print('note: %s looks like a base model -- its config does not end '
+              'turns at <|im_end|> -- so it will tend to continue the text '
+              'rather than answer. Use MODE = "complete", or the chat '
+              'version of the model (often named ...-Instruct).'
+              % s['model'])
 
 
 def run_generation(model, tok, cache, ids, s, stops, sampler):
@@ -389,11 +458,12 @@ def mode_ask(s, raw=False):
         ids = tok.encode(s['prompt'])
         sys.stdout.write(s['prompt'])
     else:
+        warn_base_model(model, s)
         ids = tok.encode(chat.render(messages_for(
             s, [{'role': 'user', 'content': s['prompt']}])))
         print('\n> %s\n' % s['prompt'])
     run_generation(model, tok, model.new_cache(), ids, s, stops,
-                   make_sampler(s))
+                   make_sampler(s, model))
 
 
 def mode_chat(s):
@@ -402,8 +472,9 @@ def mode_chat(s):
         raise SystemExit('this model has no chat template; use complete')
     print('\nchat with %s -- empty line or /quit to stop, /reset to clear'
           % s['model'].split('/')[-1])
+    warn_base_model(model, s)
     cache = model.new_cache()
-    sampler = make_sampler(s)
+    sampler = make_sampler(s, model)
     history = []
     while True:
         try:

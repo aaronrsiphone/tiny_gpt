@@ -6,7 +6,8 @@ is the one place the reference implementations are used:
 
     pip install torch transformers tokenizers safetensors
     python tests/make_hf_fixtures.py [SmolLM2-135M-Instruct dir
-                                      [Qwen2.5-Coder-1.5B dir]]
+                                      [Qwen2.5-Coder-1.5B dir
+                                       [Qwen2.5-Coder-1.5B-Instruct dir]]]
 
 Without model directories only the synthetic fixtures are rebuilt.
 
@@ -27,6 +28,8 @@ nor the *.npz/*.safetensors patterns this repo ignores or LFS-tracks:
   smollm2_logits.json SmolLM2 float32 reference logits / greedy decode
   qwen_tokens.json,   the same for Qwen2.5-Coder-1.5B
   qwen_logits.json
+  qwen_instruct_chat.json  Qwen2.5-Coder-1.5B-Instruct answering a chat
+                      message, greedy with its repetition penalty
   chat_templates.json real chat templates from several model repos,
                       rendered by transformers' own renderer (fetches the
                       templates from the Hub; skipped when offline)
@@ -262,6 +265,37 @@ def qwen_logits(model_dir):
     })
 
 
+COUNT_WORDS = (
+    'Write a Python function called `count_words` that takes a string and '
+    'returns a dictionary mapping each word to how many times it appears.'
+    '\n\nRules:\n- Treat words case-insensitively ("The" and "the" are the '
+    'same word).\n- Ignore punctuation: . , ! ? ; :\n- Split on whitespace.'
+    '\n- Use only the Python standard library.\n\nExample:\n'
+    'count_words("The cat sat. The cat ran!")\nshould return:\n'
+    '{"the": 2, "cat": 2, "sat": 1, "ran": 1}\n\n'
+    'Return only the code, with no explanation.')
+
+
+def qwen_instruct_chat(model_dir):
+    # Greedy decoding with the model's own repetition_penalty (1.1, from
+    # its generation_config.json), which transformers applies even when
+    # not sampling.
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    at = AutoTokenizer.from_pretrained(model_dir)
+    msgs = [{'role': 'user', 'content': COUNT_WORDS}]
+    ids = chat_ids(at, msgs)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_dir, dtype=torch.float32).eval()
+    with torch.no_grad():
+        gen = model.generate(torch.tensor([ids]), max_new_tokens=48,
+                             do_sample=False, repetition_penalty=1.1,
+                             pad_token_id=151643)[0].tolist()
+    dump('qwen_instruct_chat.json', {
+        'messages': msgs, 'ids': ids, 'repetition_penalty': 1.1,
+        'greedy': gen[len(ids):], 'greedy_text': at.decode(gen[len(ids):])})
+
+
 def smollm2_tokens(model_dir):
     from tokenizers import Tokenizer
     from transformers import AutoTokenizer
@@ -420,6 +454,8 @@ def main():
     if len(sys.argv) > 2:
         qwen_tokens(sys.argv[2])
         qwen_logits(sys.argv[2])
+    if len(sys.argv) > 3:
+        qwen_instruct_chat(sys.argv[3])
 
 
 if __name__ == '__main__':

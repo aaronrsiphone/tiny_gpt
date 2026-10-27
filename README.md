@@ -515,11 +515,22 @@ identical greedy output):
 |-------|--------------|--------------|---------------|
 | [HuggingFaceTB/SmolLM2-135M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct) | Llama | float32 | ~78 tok/s |
 | [HuggingFaceTB/SmolLM2-360M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct) | Llama | lowmem | ~21 tok/s (same tokenizer and template as 135M; logits not separately checked) |
+| [Qwen/Qwen2.5-Coder-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct) | Qwen2 | lowmem | not yet measured |
 | [Qwen/Qwen2.5-Coder-1.5B](https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B) | Qwen2 | lowmem | not yet measured |
 
 Other models with these architectures and a byte-level BPE tokenizer
-should work too. Qwen2.5-Coder-1.5B is a base (non-chat) code model, so
-use `MODE = 'complete'` with the start of some code as the prompt.
+should work too. For chat, use an instruct model. Base models such as
+Qwen2.5-Coder-1.5B were trained only to continue text: in chat mode they
+echo the message back (transformers does exactly the same), and
+`hf_run.py` warns about this. Use them with `MODE = 'complete'` and the
+start of some code as the prompt.
+
+Sampling follows the model's own `generation_config.json`, as transformers
+does. For example, Qwen2.5-Coder-Instruct uses temperature 0.7, top-k 20,
+top-p 0.8 and repetition penalty 1.1, which transformers applies even when
+decoding greedily. Setting `TEMPERATURE`, `TOP_K`, `TOP_P` or
+`REPETITION_PENALTY` overrides it. Without a recommendation the defaults
+are temperature 0.2 and top-p 0.9.
 `MODEL_ID` also accepts a model's huggingface.co URL.
 
 ### In Pythonista
@@ -629,7 +640,9 @@ against fixtures produced by the official libraries
   between Unicode versions (checked under Pythonista's Unicode 13 and
   Python 3.13's 15.1). Logits match `transformers` float32 to ~5e-5, and
   a 40-token greedy completion is identical. A tiny random Qwen2 matches
-  to ~3e-5 in both weight modes.
+  to ~3e-5 in both weight modes. The Instruct model's chat answer
+  (template, tokenizer, model and repetition penalty together) matches
+  transformers' greedy answer token for token.
 - **SmolLM2-135M-Instruct**: logits match `transformers` float32 to <1e-4
   at every prompt position, and a 48-token greedy decode is token-for-token
   identical. Inference runs with sockets disabled to prove it's offline.

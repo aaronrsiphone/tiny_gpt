@@ -31,6 +31,39 @@ class MemoryTest(unittest.TestCase):
         self.assertGreater(info['resident'], 0)
 
 
+class SamplingSettingsTest(unittest.TestCase):
+
+    def resolve(self, s, gen):
+        base = {'temp': None, 'top_k': None, 'top_p': None, 'rep': None}
+        base.update(s)
+        return hf_run.sampling_settings(base, gen)
+
+    def test_model_recommendation(self):
+        gen = {'do_sample': True, 'temperature': 0.7, 'top_p': 0.8,
+               'top_k': 20, 'repetition_penalty': 1.1}
+        p, src = self.resolve({}, gen)
+        self.assertEqual(p, {'temperature': 0.7, 'top_k': 20, 'top_p': 0.8,
+                             'repetition_penalty': 1.1})
+        self.assertEqual(src, 'generation_config.json')
+        p, src = self.resolve({'temp': 0}, gen)     # explicit wins
+        self.assertEqual((p['temperature'], p['repetition_penalty']),
+                         (0, 1.1))
+
+    def test_transformers_defaults_and_greedy(self):
+        p, _ = self.resolve({}, {'do_sample': True})
+        self.assertEqual((p['temperature'], p['top_k'], p['top_p']),
+                         (1.0, 50, 1.0))
+        p, _ = self.resolve({}, {'do_sample': False,
+                                 'repetition_penalty': 1.2})
+        self.assertEqual((p['temperature'], p['repetition_penalty']),
+                         (0.0, 1.2))
+
+    def test_no_recommendation(self):
+        p, src = self.resolve({}, {'eos_token_id': 2})
+        self.assertEqual(p, hf_run.DEFAULT_SAMPLING)
+        self.assertEqual(src, 'defaults')
+
+
 class AutoWeightsTest(unittest.TestCase):
 
     def test_auto(self):
