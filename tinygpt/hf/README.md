@@ -23,7 +23,9 @@ identical greedy output):
 | [Qwen/Qwen2.5-Coder-1.5B](https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B) | Qwen2 | lowmem | not yet measured |
 
 Other models with these architectures and a byte-level BPE tokenizer
-should work too. For chat, use an instruct model. Base models such as
+should work too. To find out what a model needs, run
+`python tools/hf_probe.py --remote <org>/<name>`; to add a new
+architecture, follow [ADDING_A_MODEL.md](ADDING_A_MODEL.md). For chat, use an instruct model. Base models such as
 Qwen2.5-Coder-1.5B were trained only to continue text: in chat mode they
 echo the message back (transformers does exactly the same), and
 `hf_run.py` warns about this. Use them with `MODE = 'complete'` and the
