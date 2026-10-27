@@ -7,8 +7,10 @@ One "pass" = y = W @ x for every projection in the model (q, k, v, o,
 gate, up, down for each layer, plus the vocabulary head) -- the matvec
 part of decoding one token. Methods:
 
-  slab8m     today's lowmem path: tinygpt.hf.llama.Linear (8 MB scratch,
-             BF16 -> F32 slab with NumPy, then the autotuned sgemv/gemm)
+  slab8m     the lowmem path: tinygpt.hf.llama.Linear (8 MB scratch,
+             BF16 -> F32 slab, then the autotuned sgemv/gemm). Widens with
+             BNNSCopy where available; run with TINY_GPT_BF16_CONVERT=numpy
+             for the old NumPy widening
   slab1m     same, 1 MB scratch (does a cache-sized slab help?)
   copyslab   slabs widened with BNNSCopy instead of NumPy, then sgemv
   mm_bf16    BNNSMatMul, BF16 weights straight from the mmap, F32 x -> F32 y

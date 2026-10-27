@@ -111,9 +111,16 @@ Design points:
   leaves the weights in the memory-mapped file in their stored dtype and
   widens a slab at a time into an 8 MB scratch buffer. That keeps resident
   weight memory to the OS's clean, droppable file cache, at roughly 1.5x (iPhone) to 4-5x (Linux)
-  slower decoding. Lowmem requires the memory map. If iOS can't map the
+  slower decoding (measured before BNNSCopy widening; see below). Lowmem requires the memory map. If iOS can't map the
   file, loading fails with a clear error rather than reading gigabytes
   into RAM.
+- **BF16 is widened by Accelerate's `BNNSCopy`** when it is available,
+  instead of NumPy's shift, with bit-identical results. Each lowmem slab's
+  conversion is set up once at load, so a token costs one ctypes call per
+  slab. `TINY_GPT_BF16_CONVERT=numpy` turns it off for A/B runs. Native
+  16-bit products (`BNNSMatMul`, BNNS fully connected) were also measured
+  and were not faster than widening, so they aren't used
+  (`tools/native16_bench.py`, `docs/native16_feasibility.md`).
 - **Chat reuses the KV cache.** Each turn re-renders the conversation, and
   only the tokens after the longest cached prefix are computed. When the
   context limit is reached, the oldest exchanges are dropped.
@@ -178,6 +185,19 @@ iPhone, Pythonista (Python 3.10, NumPy 1.22, Accelerate):
 
 On iOS, Accelerate wins every product by 20-180x over Pythonista's
 BLAS-less NumPy; `cblas_sgemv` and a one-row `cblas_sgemm` tie.
+
+The table predates BNNSCopy widening. `tools/native16_bench.py` on an
+iPhone 16 Pro (iOS 27.2) timed the matrix-vector work of one token over
+SmolLM2-135M's mapped BF16 weights:
+
+| widening | ms per token (matvec only) | memory added |
+|----------|----------------------------|--------------|
+| NumPy (lowmem in the table above) | 15.0 | 8 MB scratch |
+| BNNSCopy (now the default) | 8.75 | 8 MB scratch |
+| none: float32 weights | 10.75 | 650 MB |
+
+End-to-end tokens/sec with BNNSCopy have not been measured yet; rerun
+`hf_run.py selftest` to update the table.
 
 4-vCPU Linux container (NumPy + OpenBLAS, no Accelerate):
 

@@ -17,7 +17,9 @@ bounds, overlap -- before any tensor bytes are interpreted.
 
 BF16 has no NumPy dtype. It is exposed as uint16 raw bits, and
 bf16_to_f32() widens it: a bfloat16 is exactly the top half of a float32,
-so shifting the bits left by 16 is an exact conversion.
+so shifting the bits left by 16 is an exact conversion. Where Accelerate is
+available the shift is done by BNNSCopy instead of NumPy (see backend.py),
+with identical results.
 '''
 
 import json
@@ -26,6 +28,8 @@ import os
 import struct
 
 import numpy as np
+
+from tinygpt import backend
 
 DTYPES = {
     'F32': np.dtype('<f4'),
@@ -51,6 +55,10 @@ def bf16_to_f32(raw, out=None):
         out = np.empty(raw.shape, np.float32)
     elif out.shape != raw.shape or out.dtype != np.float32:
         raise ValueError('bf16_to_f32: out must be float32 %r' % (raw.shape,))
+    w = backend.bf16_widener(raw, out)
+    if w is not None:
+        w()
+        return out
     np.left_shift(raw, 16, out=out.view(np.uint32), dtype=np.uint32,
                   casting='unsafe')
     return out
@@ -64,6 +72,17 @@ def to_f32(raw, dtype, out=None):
         return np.array(raw, dtype=np.float32)
     out[...] = raw
     return out
+
+
+def widener(raw, dtype, out):
+    '''A zero-argument function that converts raw into out (float32) every
+    time it is called. For a conversion repeated on every token, as lowmem
+    mode does: the BF16 fast path's setup is paid here, once.'''
+    if dtype == 'BF16':
+        w = backend.bf16_widener(raw, out)
+        if w is not None:
+            return w
+    return lambda: to_f32(raw, dtype, out)
 
 
 class TensorInfo(object):

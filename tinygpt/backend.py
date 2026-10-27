@@ -71,6 +71,75 @@ def _p(a):
     return a.ctypes.data_as(ctypes.c_void_p)
 
 
+# BNNSCopy widens BF16 to float32 for the Hugging Face lowmem path. Measured
+# on an iPhone 16 Pro (iOS 27.2), one token's matrix-vector work over
+# SmolLM2-135M's mapped BF16 weights took 15.0 ms with NumPy widening the
+# slabs and 8.75 ms with BNNSCopy, bit-exact (tools/native16_bench.py).
+# TINY_GPT_BF16_CONVERT=numpy to A/B it. TINY_GPT_BNNS points at another
+# library providing BNNSCopy (the tests use a fake one) since Accelerate
+# itself only exists on Apple platforms.
+
+class _NDArrayDesc(ctypes.Structure):
+    '''BNNSNDArrayDescriptor, as declared in the SDK's bnns_structures.h.'''
+    _fields_ = [('flags', ctypes.c_uint32), ('layout', ctypes.c_uint32),
+                ('size', ctypes.c_size_t * 8), ('stride', ctypes.c_size_t * 8),
+                ('data', ctypes.c_void_p), ('data_type', ctypes.c_uint32),
+                ('table_data', ctypes.c_void_p),
+                ('table_data_type', ctypes.c_uint32),
+                ('data_scale', ctypes.c_float), ('data_bias', ctypes.c_float)]
+
+
+_BNNS_LAYOUT_VECTOR = 0x10000
+_BNNS_BF16 = 0x18010
+_BNNS_F32 = 0x10020
+
+
+def _bind_bnns_copy(path):
+    try:
+        f = ctypes.CDLL(path).BNNSCopy
+    except (OSError, AttributeError):
+        return None
+    f.restype = ctypes.c_int
+    f.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+    return f
+
+
+USE_BNNS_COPY = os.environ.get('TINY_GPT_BF16_CONVERT', 'bnns') != 'numpy'
+_bnns_copy = _bind_bnns_copy(os.environ.get('TINY_GPT_BNNS', _LIB_PATH)) \
+    if USE_BNNS_COPY else None
+HAVE_BNNS_COPY = _bnns_copy is not None
+
+
+def bf16_widener(src, dst):
+    '''A zero-argument function writing float32(src) into dst, or None.
+
+    src is uint16 BF16 bits and dst float32, both C-contiguous and the
+    same size. Both descriptors are built here, once, so each call costs a
+    single ctypes call; the lowmem path calls it for every slab of every
+    token. Returns None when BNNSCopy is unavailable or the arrays don't
+    qualify, and the caller widens with NumPy instead.
+    '''
+    if (_bnns_copy is None or src.dtype != np.uint16
+            or dst.dtype != np.float32 or src.size != dst.size
+            or src.size == 0 or not src.flags.c_contiguous
+            or not dst.flags.c_contiguous):
+        return None
+    sd, dd = _NDArrayDesc(), _NDArrayDesc()
+    for d, a, t in ((sd, src, _BNNS_BF16), (dd, dst, _BNNS_F32)):
+        d.layout = _BNNS_LAYOUT_VECTOR
+        d.size[0] = a.size
+        d.data = a.ctypes.data
+        d.data_type = t
+    ps, pd, copy = ctypes.byref(sd), ctypes.byref(dd), _bnns_copy
+
+    def widen():
+        if copy(pd, ps, None):
+            raise RuntimeError('BNNSCopy failed')
+    # The descriptors hold raw pointers: keep the arrays alive with them.
+    widen.keep = (src, dst, sd, dd)
+    return widen
+
+
 def _vforce(name):
     """Bind an Accelerate vForce function, or None if unavailable.
 
