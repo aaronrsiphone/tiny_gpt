@@ -9,9 +9,10 @@ always available. The SmolLM2 tests run when the model is cached
 import os
 import unittest
 
-from tests.hf_common import fixture, smollm2_dir
+from tests.hf_common import fixture, qwen_dir, smollm2_dir
 from tinygpt.hf.tokenizer import (BPETokenizer, ChatFormat,
-                                  UnsupportedTokenizer, bytes_to_unicode)
+                                  UnsupportedTokenizer, bytes_to_unicode,
+                                  translate_regex)
 
 
 class ByteMapTest(unittest.TestCase):
@@ -61,7 +62,7 @@ class TinyBPETest(unittest.TestCase):
     def test_unsupported_configs_rejected(self):
         import copy
         for mutate in (
-                lambda s: s.__setitem__('normalizer', {'type': 'NFC'}),
+                lambda s: s.__setitem__('normalizer', {'type': 'NFKC'}),
                 lambda s: s['model'].__setitem__('byte_fallback', True),
                 lambda s: s['model'].__setitem__('dropout', 0.1),
                 lambda s: s.__setitem__('pre_tokenizer',
@@ -71,6 +72,44 @@ class TinyBPETest(unittest.TestCase):
             mutate(spec)
             with self.assertRaises(UnsupportedTokenizer):
                 BPETokenizer(spec)
+
+
+class TinyQwenBPETest(unittest.TestCase):
+    '''A small tokenizer trained with Qwen2's pipeline: NFC normalizer,
+    Split regex with case-insensitive contractions, ByteLevel without
+    its own regex. Its texts include combining marks the reference's
+    older NFC tables leave alone.'''
+
+    def test_encode_decode_exact(self):
+        d = fixture('bpe_tiny_qwen.json')
+        tok = BPETokenizer(d['tokenizer'])
+        check_against(self, tok, d['texts'], d['ids'], d['decoded'])
+
+
+class TranslateRegexTest(unittest.TestCase):
+
+    def test_qwen_pattern_compiles(self):
+        import re
+        pat = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+"
+               r"|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
+        rx = re.compile(translate_regex(pat))
+        self.assertEqual(rx.findall("I'LL x\u00e9  12"),
+                         ['I', "'LL", ' x\u00e9', ' ', ' ', '1', '2'])
+
+    def test_unsupported_rejected(self):
+        for pat in (r'\d+', r'\w+', r'\p{Lu}', r'[[:alpha:]]', r'[^\S]',
+                    r'\bx', r'[\P{L}]', r'[abc'):
+            with self.assertRaises(UnsupportedTokenizer, msg=pat):
+                translate_regex(pat)
+
+
+@unittest.skipUnless(qwen_dir(), 'Qwen2.5-Coder-1.5B not cached')
+class QwenTokenizerTest(unittest.TestCase):
+
+    def test_texts(self):
+        d = fixture('qwen_tokens.json')
+        tok = BPETokenizer.from_dir(qwen_dir())
+        check_against(self, tok, d['texts'], d['ids'])
 
 
 @unittest.skipUnless(smollm2_dir(), 'SmolLM2 not cached')

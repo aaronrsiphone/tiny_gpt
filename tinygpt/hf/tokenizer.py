@@ -2,15 +2,17 @@
 '''
 Byte-level BPE, read from a Hugging Face tokenizer.json, in pure Python.
 
-This reproduces what the Rust `tokenizers` library does for GPT-2-style
-byte-level BPE models (SmolLM2, GPT-2, ...), step for step, so the ids are
-the ones the model was trained on rather than an approximation of them:
+This reproduces what the Rust `tokenizers` library does for byte-level
+BPE models (SmolLM2, Qwen2, GPT-2, ...), step for step, so the ids are the
+ones the model was trained on rather than an approximation of them:
 
   1. Added tokens (<|im_start|> and friends) are cut out of the text
      first, leftmost-longest, and map straight to their ids.
-  2. The remaining text is pre-tokenized: optionally every numeric char is
-     isolated (the Digits step), then the GPT-2 regex splits it into
-     words, and each byte of a word is mapped to a printable stand-in char.
+  2. The rest is normalized if the tokenizer says so (Unicode NFC for
+     Qwen2), then pre-tokenized by the configured steps in order: Digits
+     (isolate every numeric char), Split (a regex, e.g. Qwen2's), and
+     ByteLevel (the GPT-2 regex, unless use_regex is off). Each byte of
+     the resulting words is mapped to a printable stand-in char.
   3. Each word is merged by the BPE merge ranks with the same priority
      queue the Rust code uses, so even oddly ordered merge tables agree.
 
@@ -19,10 +21,12 @@ replacement, as the ByteLevel decoder does.
 
 The regex classes \\p{L}, \\p{N}, \\s are not available in Python's re
 module, so they come from unicode_tables.py, which was measured from the
-reference library itself (see tools/gen_unicode_tables.py).
+reference library itself (see tools/gen_unicode_tables.py), and a Split
+step's pattern is translated to use them (translate_regex).
 
 Anything in tokenizer.json this module does not implement exactly -- a
-normalizer, a different pre-tokenizer, byte fallback, BPE dropout --
+normalizer other than NFC, an unknown pre-tokenizer step,
+byte fallback, BPE dropout --
 raises at load time instead of silently tokenizing differently.
 '''
 
@@ -31,6 +35,7 @@ import heapq
 import json
 import os
 import re
+import unicodedata
 
 from tinygpt.hf import unicode_tables as _ut
 
@@ -94,32 +99,196 @@ def _regexes():
 
 # ----------------------------------------------------------------- config
 
-def _check_pre_tokenizer(pt):
-    '''Return (isolate_digits, add_prefix_space) or raise.'''
+def translate_regex(pattern):
+    '''A tokenizers (Oniguruma) regex -> an equivalent Python re pattern.
+
+    \\p{L}, \\p{N} and \\s (and \\S, \\P{..} outside a class) become explicit
+    character classes from unicode_tables.py. Anything whose meaning could
+    differ between the two engines (\\d, \\w, \\b, POSIX classes, other
+    properties) is refused rather than translated loosely.
+    '''
+    bodies = {'L': _L, 'N': _N}
+    out = []
+    i = 0
+    in_cls = False
+    n = len(pattern)
+    while i < n:
+        c = pattern[i]
+        if c == '\\' and i + 1 < n:
+            e = pattern[i + 1]
+            if e in 'pP':
+                m = re.match(r'\{(\w+)\}', pattern[i + 2:])
+                if not m or m.group(1) not in bodies:
+                    raise UnsupportedTokenizer('regex property %r is not '
+                                               'supported' % pattern[i:i + 8])
+                body = bodies[m.group(1)]
+                if in_cls:
+                    if e == 'P':
+                        raise UnsupportedTokenizer('\\P{..} inside a class')
+                    out.append(body)
+                else:
+                    out.append(('[^%s]' if e == 'P' else '[%s]') % body)
+                i += 2 + m.end()
+                continue
+            if e == 's':
+                out.append(_W if in_cls else '[%s]' % _W)
+            elif e == 'S':
+                if in_cls:
+                    raise UnsupportedTokenizer('\\S inside a class')
+                out.append('[^%s]' % _W)
+            elif e in 'dDwWbBhHRXKG' or e.isdigit() and e != '0':
+                raise UnsupportedTokenizer('regex escape \\%s is not '
+                                           'supported' % e)
+            else:
+                out.append(pattern[i:i + 2])
+            i += 2
+            continue
+        if in_cls:
+            if c == '[':
+                raise UnsupportedTokenizer('nested/POSIX character classes '
+                                           'are not supported')
+            if c == ']':
+                in_cls = False
+            out.append(c)
+            i += 1
+            continue
+        if c == '[':
+            in_cls = True
+            j = i + 1
+            if pattern[j:j + 1] == '^':
+                j += 1
+            if pattern[j:j + 1] == ']':       # literal ] first in a class
+                j += 1
+            out.append(pattern[i:j].replace(']', '\\]'))
+            i = j
+            continue
+        out.append(c)
+        i += 1
+    if in_cls:
+        raise UnsupportedTokenizer('unterminated character class')
+    return ''.join(out)
+
+
+def _isolated_split(rx):
+    '''Split behaviour "Isolated": each match is a piece of its own, and
+    so is each stretch of text between matches.'''
+    def step(pieces):
+        out = []
+        for p in pieces:
+            pos = 0
+            for m in rx.finditer(p):
+                if m.start() > pos:
+                    out.append(p[pos:m.start()])
+                if m.end() > m.start():
+                    out.append(m.group(0))
+                pos = m.end()
+            if pos < len(p):
+                out.append(p[pos:])
+        return out
+    return step
+
+
+def _pre_tokenizer_steps(pt):
+    '''tokenizer.json pre_tokenizer -> (list of steps, add_prefix_space).
+
+    Each step maps a list of text pieces to a finer list, as each
+    pre-tokenizer in a Sequence refines the splits of the one before.
+    '''
     if pt is None:
         raise UnsupportedTokenizer('tokenizer has no pre_tokenizer; only '
                                    'byte-level BPE is supported')
-    steps = pt['pretokenizers'] if pt.get('type') == 'Sequence' else [pt]
-    digits = False
-    bytelevel = None
-    for i, st in enumerate(steps):
+    specs = pt['pretokenizers'] if pt.get('type') == 'Sequence' else [pt]
+    if not specs or specs[-1].get('type') != 'ByteLevel':
+        raise UnsupportedTokenizer('pre-tokenizer does not end in ByteLevel')
+    steps = []
+    prefix = False
+    for i, st in enumerate(specs):
         t = st.get('type')
-        if t == 'Digits' and i == 0 and len(steps) > 1:
+        if t == 'Digits':
             if not st.get('individual_digits', False):
                 raise UnsupportedTokenizer(
                     'Digits pre-tokenizer without individual_digits')
-            digits = True
-        elif t == 'ByteLevel' and i == len(steps) - 1:
-            if not st.get('use_regex', True):
-                raise UnsupportedTokenizer('ByteLevel with use_regex=false')
-            bytelevel = st
+            steps.append(('digits', None))
+        elif t == 'Split':
+            pat = st.get('pattern') or {}
+            if 'Regex' in pat:
+                rx = translate_regex(pat['Regex'])
+            elif 'String' in pat:
+                rx = re.escape(pat['String'])
+            else:
+                raise UnsupportedTokenizer('Split pattern %r' % (pat,))
+            if st.get('behavior') != 'Isolated' or st.get('invert'):
+                raise UnsupportedTokenizer(
+                    'Split behavior %r (invert=%r) is not supported'
+                    % (st.get('behavior'), st.get('invert')))
+            steps.append(('split', rx))
+        elif t == 'ByteLevel' and i == len(specs) - 1:
+            prefix = bool(st.get('add_prefix_space', False))
+            if prefix and len(specs) > 1:
+                raise UnsupportedTokenizer('ByteLevel add_prefix_space after '
+                                           'other pre-tokenizers')
+            if st.get('use_regex', True):
+                steps.append(('gpt2', None))
         else:
             raise UnsupportedTokenizer(
-                'unsupported pre-tokenizer step %r (supported: optional '
-                'Digits, then ByteLevel)' % t)
-    if bytelevel is None:
-        raise UnsupportedTokenizer('pre-tokenizer does not end in ByteLevel')
-    return digits, bool(bytelevel.get('add_prefix_space', False))
+                'unsupported pre-tokenizer step %r (supported: Digits, '
+                'Split, ByteLevel)' % t)
+    return steps, prefix
+
+
+def _compile_steps(steps):
+    gpt2, numeric = _regexes()
+    out = []
+    for kind, arg in steps:
+        if kind == 'digits':
+            out.append(lambda ps: [x for p in ps for x in numeric.split(p)
+                                   if x])
+        elif kind == 'split':
+            out.append(_isolated_split(re.compile(arg)))
+        else:
+            out.append(lambda ps: [w for p in ps for w in gpt2.findall(p)])
+    return out
+
+
+_nfc_inert_re = None
+
+
+def nfc(text):
+    '''Unicode NFC as the reference library computes it.
+
+    Its normalization tables are older than Python's unicodedata, so the
+    characters in unicode_tables.NFC_INERT (combining marks from newer
+    Unicode versions) are ones it leaves alone: no reordering, no
+    composition, as if unassigned. An unassigned character is a starter
+    that nothing composes across, so normalizing the stretches between
+    those characters separately is exactly what the reference does.
+    Measured to agree on every codepoint under Unicode 13 (Pythonista)
+    and 15.1.
+    '''
+    global _nfc_inert_re
+    if _nfc_inert_re is None:
+        _nfc_inert_re = re.compile('([%s])' % _cls(_ut.NFC_INERT))
+    parts = _nfc_inert_re.split(text)
+    for i in range(0, len(parts), 2):     # even indices: between inert chars
+        parts[i] = unicodedata.normalize('NFC', parts[i])
+    return ''.join(parts)
+
+
+def _normalizer(spec):
+    '''tokenizer.json normalizer -> a str -> str function, or None.
+
+    Only NFC is supported: it is what Qwen2 uses, and the only form whose
+    agreement with the reference has been measured (see nfc()).
+    '''
+    if spec is None:
+        return None
+    if spec.get('type') == 'Sequence' and len(spec.get('normalizers')
+                                               or ()) == 1:
+        spec = spec['normalizers'][0]
+    if spec.get('type') != 'NFC':
+        raise UnsupportedTokenizer('normalizer %r is not supported (only '
+                                   'NFC)' % spec.get('type'))
+    return nfc
 
 
 def _check_model(m):
@@ -151,9 +320,7 @@ class BPETokenizer(object):
 
     def __init__(self, spec, config=None):
         config = config or {}
-        if spec.get('normalizer') is not None:
-            raise UnsupportedTokenizer('tokenizer normalizers are not '
-                                       'supported')
+        self.normalize = _normalizer(spec.get('normalizer'))
         pp = spec.get('post_processor')
         if pp is not None and pp.get('type') != 'ByteLevel':
             raise UnsupportedTokenizer(
@@ -164,8 +331,9 @@ class BPETokenizer(object):
                                        % dec.get('type'))
         m = spec['model']
         _check_model(m)
-        self.isolate_digits, self.add_prefix_space = \
-            _check_pre_tokenizer(spec.get('pre_tokenizer'))
+        steps, self.add_prefix_space = \
+            _pre_tokenizer_steps(spec.get('pre_tokenizer'))
+        self._steps = _compile_steps(steps)
 
         self.token_to_id = {t: int(i) for t, i in m['vocab'].items()}
         self.added = {}
@@ -174,6 +342,11 @@ class BPETokenizer(object):
             if a.get('lstrip') or a.get('rstrip') or a.get('single_word'):
                 raise UnsupportedTokenizer(
                     'added token %r uses lstrip/rstrip/single_word'
+                    % a['content'])
+            if (a.get('normalized') and self.normalize is not None
+                    and self.normalize(a['content']) != a['content']):
+                raise UnsupportedTokenizer(
+                    'added token %r changes under normalization'
                     % a['content'])
             self.added[a['content']] = int(a['id'])
             self.token_to_id[a['content']] = int(a['id'])
@@ -246,14 +419,14 @@ class BPETokenizer(object):
     # -- encoding ---------------------------------------------------------
 
     def _words(self, text):
-        gpt2, numeric = _regexes()
+        if self.normalize is not None:
+            text = self.normalize(text)
         if self.add_prefix_space and text and not text[0].isspace():
             text = ' ' + text
-        pieces = numeric.split(text) if self.isolate_digits else [text]
-        for piece in pieces:
-            if piece:
-                for w in gpt2.findall(piece):
-                    yield w
+        pieces = [text] if text else []
+        for step in self._steps:
+            pieces = step(pieces)
+        return pieces
 
     def _bpe(self, word):
         ids = self._cache.get(word)

@@ -12,6 +12,7 @@ import numpy as np
 HERE = os.path.dirname(os.path.abspath(__file__))
 FIX = os.path.join(HERE, 'fixtures')
 SMOLLM2 = 'HuggingFaceTB/SmolLM2-135M-Instruct'
+QWEN = 'Qwen/Qwen2.5-Coder-1.5B'
 
 
 def fixture(name):
@@ -60,10 +61,18 @@ def write_safetensors(path, tensors, header_override=None):
     return path
 
 
-def smollm2_dir():
-    '''The cached SmolLM2 snapshot, or None (the real-model tests skip).'''
+def cached(repo_id):
+    '''The cached snapshot of a model, or None (its tests then skip).'''
     try:
         from tinygpt.hf import hub
-        return hub.find_local(SMOLLM2)
+        return hub.find_local(repo_id)
     except Exception:
         return None
+
+
+def smollm2_dir():
+    return cached(SMOLLM2)
+
+
+def qwen_dir():
+    return cached(QWEN)

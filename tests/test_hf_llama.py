@@ -11,12 +11,13 @@ import unittest
 
 import numpy as np
 
-from tests.hf_common import b64_array, fixture, smollm2_dir, tiny_model_dir
+from tests.hf_common import (b64_array, fixture, qwen_dir, smollm2_dir,
+                             tiny_model_dir)
 from tinygpt.hf.llama import (ContextFull, LlamaConfig, LlamaModel, Sampler,
                               UnsupportedModel, generate)
 
 TINY = ['tiny_llama_tied_bf16.json', 'tiny_llama_untied_f16.json',
-        'tiny_llama_mha_f32.json']
+        'tiny_llama_mha_f32.json', 'tiny_qwen2_bf16.json']
 
 
 def load_tiny(name, **kw):
@@ -123,6 +124,35 @@ class TinyLlamaTest(unittest.TestCase):
             LlamaModel.from_dir(td)
 
 
+class Qwen2ConfigTest(unittest.TestCase):
+
+    def test_biases(self):
+        cfg = LlamaConfig(fixture('tiny_qwen2_bf16.json')['config'])
+        self.assertEqual((cfg.qkv_bias, cfg.o_bias, cfg.mlp_bias),
+                         (True, False, False))
+        self.assertIsNone(cfg.sliding_window)
+
+    def test_sliding_window_caps_context(self):
+        import json
+        import os
+        td, d = tiny_model_dir('tiny_qwen2_bf16.json')
+        cfg = dict(d['config'], use_sliding_window=True, sliding_window=8,
+                   layer_types=None)
+        with open(os.path.join(td, 'config.json'), 'w') as f:
+            json.dump(cfg, f)
+        m = LlamaModel.from_dir(td, ctx_limit=64)
+        self.assertEqual(m.ctx_limit, 8)
+        cfg['layer_types'] = ['sliding_attention'] * cfg['num_hidden_layers']
+        cfg['use_sliding_window'] = False
+        self.assertEqual(LlamaConfig(cfg).sliding_window, 8)
+
+    def test_wrong_architecture_for_type(self):
+        cfg = dict(fixture('tiny_qwen2_bf16.json')['config'],
+                   architectures=['LlamaForCausalLM'])
+        with self.assertRaises(UnsupportedModel):
+            LlamaConfig(cfg)
+
+
 class SamplerTest(unittest.TestCase):
 
     def test_greedy_and_top_k1(self):
@@ -196,6 +226,38 @@ class SmolLM2Test(unittest.TestCase):
                                       self.d['ids'], 48, Sampler(0.0),
                                       stop_ids={2})
         self.assertEqual(out, want)
+
+
+@unittest.skipUnless(qwen_dir(), 'Qwen2.5-Coder-1.5B not cached')
+class QwenTest(unittest.TestCase):
+    '''The real 1.5B checkpoint, lowmem (float32 would need ~6 GB).'''
+
+    @classmethod
+    def setUpClass(cls):
+        cls.d = fixture('qwen_logits.json')
+        with _NoNetwork():
+            cls.model = LlamaModel.from_dir(qwen_dir(), ctx_limit=64,
+                                            weights='lowmem')
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.model.close()
+        del cls.model
+
+    def test_logits_and_greedy(self):
+        d = self.d
+        ids, cols = d['ids'], d['logits_cols']
+        ref = b64_array(d['logits_sel'], (len(ids), len(cols)))
+        last = b64_array(d['last_logits'])
+        with _NoNetwork():
+            got = self.model.prefill(ids, self.model.new_cache(),
+                                     all_logits=True)
+            self.assertLess(np.abs(got[:, cols] - ref).max(), 1e-3)
+            self.assertLess(np.abs(got[-1] - last).max(), 1e-3)
+            # 12 tokens keeps this quick on a phone (~5 tok/s).
+            out, _, _ = generate(self.model, self.model.new_cache(), ids, 12,
+                                 Sampler(0.0), stop_ids={151643})
+        self.assertEqual(out, d['greedy'][:12])
 
 
 if __name__ == '__main__':

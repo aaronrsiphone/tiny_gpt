@@ -43,8 +43,10 @@ TEMPERATURE = 0.2       # 0 = greedy (deterministic)
 TOP_K = 0               # 0 = off
 TOP_P = 0.9             # 1.0 = off
 CONTEXT_LIMIT = 1024    # tokens of KV cache; ~7 MB per 100 for SmolLM2-135M
-WEIGHTS = 'float32'     # 'float32' (fast, ~540 MB) or 'lowmem' (~30 MB of
-                        # weights resident + the OS file cache; slower)
+WEIGHTS = 'auto'        # 'auto': float32 for small models, lowmem otherwise
+                        # 'float32': widened once at load, 4 bytes/param
+                        # 'lowmem': weights stay in the file (~0 MB counted
+                        #           against the app), widened as used
 SYSTEM_PROMPT = None    # None = the model's own default
 SEED = 0
 CACHE_DIR = None        # None = hf_models/ next to this script
@@ -72,7 +74,7 @@ def settings_from_argv(argv):
     p.add_argument('--top-k', type=int, default=TOP_K)
     p.add_argument('--top-p', type=float, default=TOP_P)
     p.add_argument('--ctx', type=int, default=CONTEXT_LIMIT)
-    p.add_argument('--weights', choices=['float32', 'lowmem'],
+    p.add_argument('--weights', choices=['auto', 'float32', 'lowmem'],
                    default=WEIGHTS)
     p.add_argument('--seed', type=int, default=SEED)
     p.add_argument('--system', default=SYSTEM_PROMPT)
@@ -212,9 +214,26 @@ def locate(s):
         % s['model'])
 
 
+# 'auto' picks float32 up to this many MB of float32 weights. Measured on
+# an iPhone: float32 decoded 1.5x faster than lowmem at 135M params (540
+# MB), and no faster at 360M (1.45 GB) while using ~1.8 GB more memory.
+AUTO_FLOAT32_MAX_MB = 1000
+# Explicit float32 above this is refused on iOS: the system would kill
+# Pythonista without any Python-level MemoryError.
+IOS_FLOAT32_MAX_MB = 2500
+
+
+def resolve_weights(mode, cfg):
+    if mode != 'auto':
+        return mode
+    return 'float32' if cfg.n_params() * 4 <= AUTO_FLOAT32_MAX_MB << 20 \
+        else 'lowmem'
+
+
 def load(s, quiet=False):
     from tinygpt import backend
     from tinygpt.hf.llama import LlamaModel, UnsupportedModel
+    from tinygpt.hf.safetensors import SafetensorsError
     from tinygpt.hf.tokenizer import BPETokenizer, ChatFormat
     import json
     path = locate(s)
@@ -225,19 +244,26 @@ def load(s, quiet=False):
         cfg = LlamaConfig(raw_cfg)
     except UnsupportedModel as e:
         raise SystemExit('unsupported model: %s' % e)
-    ctx = min(s['ctx'], cfg.max_pos)
-    est = (cfg.n_params() * 4 if s['weights'] == 'float32' else 8 << 20) \
+    ctx = min(s['ctx'], cfg.max_pos, cfg.sliding_window or cfg.max_pos)
+    weights = resolve_weights(s['weights'], cfg)
+    est = (cfg.n_params() * 4 if weights == 'float32' else 8 << 20) \
         + cfg.kv_bytes(ctx)
+    if (weights == 'float32' and sys.platform == 'ios'
+            and est > IOS_FLOAT32_MAX_MB << 20):
+        raise SystemExit(
+            'float32 weights for this model need about %d MB, more than '
+            'iOS lets Pythonista use. Use WEIGHTS = "lowmem" (or "auto").'
+            % (est >> 20))
     if not quiet:
         print('%s  (%s params)' % (s['model'], '{:,}'.format(cfg.n_params())))
         print(cfg.describe())
-        print('weights %s, context %d, needs about %d MB; Accelerate %s'
-              % (s['weights'], ctx, est >> 20,
+        print('weights %s%s, context %d, needs about %d MB; Accelerate %s'
+              % (weights, ' (auto)' if s['weights'] == 'auto' else '', ctx,
+                 est >> 20,
                  'yes' if backend.HAVE_ACCELERATE else 'no (NumPy only)'))
     t0 = time.time()
     try:
-        model = LlamaModel.from_dir(path, ctx_limit=ctx,
-                                    weights=s['weights'])
+        model = LlamaModel.from_dir(path, ctx_limit=ctx, weights=weights)
     except MemoryError:
         raise SystemExit(
             'out of memory loading the weights (needs about %d MB).\n'
@@ -245,6 +271,8 @@ def load(s, quiet=False):
             % (est >> 20))
     except UnsupportedModel as e:
         raise SystemExit('unsupported model: %s' % e)
+    except SafetensorsError as e:
+        raise SystemExit('cannot load the weights: %s' % e)
     t_load = time.time() - t0
     tok = BPETokenizer.from_dir(path)
     try:
@@ -264,6 +292,11 @@ def load(s, quiet=False):
                                                     else []))
     if tok.eos_id is not None:
         stops.add(tok.eos_id)
+    # A ChatML turn ends at <|im_end|>. Instruct models list it as an eos
+    # token; base models (Qwen2.5-Coder) do not, but may still emit it.
+    if chat is not None and '<|im_end|>' in (tok.chat_template or ''):
+        if '<|im_end|>' in tok.token_to_id:
+            stops.add(tok.token_to_id['<|im_end|>'])
     if not quiet:
         pk = peak_rss_mb()
         print('loaded in %.1fs, memory now %s (peak so far %s MB)'
@@ -407,14 +440,14 @@ def bench(s, out=print):
     mem0 = memory_line()
     model, tok, chat, stops, t_load = load(s, quiet=True)
     mem1 = memory_line()
-    out('model        %s (%s)' % (s['model'], s['weights']))
+    out('model        %s (%s)' % (s['model'], model.weights))
     out('platform     %s, python %s, numpy %s'
         % (sys.platform, sys.version.split()[0], __import__('numpy')
            .__version__))
     out('accelerate   %s (sgemv %s)' % (backend.HAVE_ACCELERATE,
                                        backend.HAVE_SGEMV))
     out('load         %.2f s' % t_load)
-    if s['weights'] == 'float32':
+    if model.weights == 'float32':
         out('backend choice per weight shape (timed at load):')
         out(model.mv.report())
     prompt = chat.render([{'role': 'user', 'content':
