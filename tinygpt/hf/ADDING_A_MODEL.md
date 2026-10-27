@@ -374,9 +374,15 @@ repetition_penalty 1.1, eos [124900].
    `tokenizers` (digit-group regex, decode with the ByteLevel decoder's
    `add_prefix_space: true`; check that it really changes nothing on
    decode).
-2. Decide the reference with the user: run the repo's `modeling_lfm3.py`
-   via `trust_remote_code` in the scratch venv (it is executing the repo's
-   code), or adapt native `lfm2` plus an independent check.
+2. Reference: the user can point to a **transformers branch with native
+   `lfm3` support**. Ask for it and install it into the scratch venv
+   (`pip install git+https://github.com/<owner>/transformers@<branch>`).
+   That is the preferred reference, since no repository code runs.
+   Fallbacks, in order: the repo's `modeling_lfm3.py` via
+   `trust_remote_code` (executes the repo's code, so only with the user's
+   OK), or native `lfm2` plus an independent check. (The BF16/BNNSCopy
+   branch this builds on was already tested by the user in another
+   session.)
 3. New module `tinygpt/hf/lfm3.py`: a layer list by type, the conv layer
    with its state, gated attention with QK-norm and zero-tail partial
    RoPE per layer type, a sliding-window KV, sandwich norms, the final
