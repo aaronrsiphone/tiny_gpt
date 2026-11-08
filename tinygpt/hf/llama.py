@@ -111,6 +111,8 @@ class LlamaConfig(object):
                    else bool(d.get('use_sliding_window', False)))
         self.sliding_window = (int(d['sliding_window'])
                                if sliding and d.get('sliding_window') else None)
+        self.max_context = min(self.max_pos,
+                               self.sliding_window or self.max_pos)
         self.bos_id = d.get('bos_token_id')
         eos = d.get('eos_token_id')
         self.eos_ids = set(eos if isinstance(eos, list) else

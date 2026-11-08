@@ -14,6 +14,7 @@ FIX = os.path.join(HERE, 'fixtures')
 SMOLLM2 = 'HuggingFaceTB/SmolLM2-135M-Instruct'
 QWEN = 'Qwen/Qwen2.5-Coder-1.5B'
 QWEN_INSTRUCT = 'Qwen/Qwen2.5-Coder-1.5B-Instruct'
+LFM3 = 'LiquidAI/LFM3-1.7B'
 
 
 def fixture(name):
@@ -81,3 +82,7 @@ def qwen_dir():
 
 def qwen_instruct_dir():
     return cached(QWEN_INSTRUCT)
+
+
+def lfm3_dir():
+    return cached(LFM3)

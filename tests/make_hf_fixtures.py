@@ -5,9 +5,11 @@ Hugging Face libraries. The tests themselves need only NumPy; this script
 is the one place the reference implementations are used:
 
     pip install torch transformers tokenizers safetensors
-    python tests/make_hf_fixtures.py [SmolLM2-135M-Instruct dir
+    python tests/make_hf_fixtures.py [--lfm3=LFM3-1.7B dir]
+                                     [SmolLM2-135M-Instruct dir
                                       [Qwen2.5-Coder-1.5B dir
                                        [Qwen2.5-Coder-1.5B-Instruct dir]]]
+    python tests/make_hf_fixtures.py --only-lfm3 [--lfm3=dir]
 
 Without model directories only the synthetic fixtures are rebuilt.
 
@@ -30,6 +32,12 @@ nor the *.npz/*.safetensors patterns this repo ignores or LFS-tracks:
   qwen_logits.json
   qwen_instruct_chat.json  Qwen2.5-Coder-1.5B-Instruct answering a chat
                       message, greedy with its repetition penalty
+  tiny_lfm3_via_lfm2.json
+                      a random tiny LFM3 reduced to what transformers'
+                      built-in LFM2 computes, with LFM2's logits
+  tiny_lfm3.json      a random tiny LFM3 with every LFM3 feature, with
+                      logits from lfm3_reference_forward() below
+  lfm3_tokens.json    LFM3-1.7B encodings (ignore_merges, digit groups)
   chat_templates.json real chat templates from several model repos,
                       rendered by transformers' own renderer (fetches the
                       templates from the Hub; skipped when offline)
@@ -420,8 +428,250 @@ def chat_templates():
     dump('chat_templates.json', {'now': list(FIXED_NOW), 'repos': out})
 
 
+# ----------------------------------------------------------------- lfm3
+
+LFM3_BASE = dict(vocab_size=160, hidden_size=48, intermediate_size=96,
+                 num_attention_heads=6, num_key_value_heads=2, head_dim=8,
+                 max_position_embeddings=256, norm_eps=1e-5, conv_L_cache=7,
+                 conv_bias=False, bos_token_id=1, eos_token_id=2,
+                 pad_token_id=0, tie_word_embeddings=True)
+
+
+def _randomize(model, seed):
+    import torch
+    torch.manual_seed(seed)
+    with torch.no_grad():
+        for p in model.parameters():
+            p.normal_(0, 0.3)
+        for n, p in model.named_parameters():
+            if 'norm' in n:
+                p.add_(1.0)
+
+
+def _lfm3_dump(name, cfg_json, sd, ids, logits, note):
+    from safetensors.torch import save
+    import torch
+    sd = {k: v.detach().to(torch.bfloat16).contiguous()
+          for k, v in sd.items()}
+    dump(name, {'config': cfg_json, 'safetensors': b64(save(sd)),
+                'ids': ids, 'logits': b64(logits.tobytes()),
+                'logits_shape': list(logits.shape), 'reference': note})
+
+
+def _bf16_round(sd):
+    import torch
+    return {k: v.detach().to(torch.bfloat16).float() for k, v in sd.items()}
+
+
+def tiny_lfm3_via_lfm2():
+    '''A tiny LFM3 whose forward pass equals transformers' built-in LFM2
+    (no sandwich norms, full RoPE, gate weights zero so the gate is a
+    constant 1/2, made up for by doubling o_proj). LFM2 shares LFM3's
+    short-conv block, QK-norm attention and final embedding_norm, so this
+    checks those against library code without running repository code.'''
+    import torch
+    import transformers
+    layer_types = ['conv', 'full_attention', 'conv', 'conv',
+                   'full_attention']
+    kw = dict(LFM3_BASE, num_hidden_layers=len(layer_types),
+              layer_types=layer_types, block_auto_adjust_ff_dim=False,
+              rope_parameters={'rope_type': 'default',
+                               'rope_theta': 10000.0})
+    cfg = transformers.Lfm2Config(**kw)
+    model = transformers.Lfm2ForCausalLM(cfg).eval()
+    _randomize(model, 11)
+    sd = _bf16_round(model.state_dict())
+    sd.pop('lm_head.weight', None)
+    model.load_state_dict(sd, strict=False)
+    model.tie_weights()
+    g = torch.Generator().manual_seed(12)
+    ids = torch.randint(0, cfg.vocab_size, (1, 30), generator=g)
+    with torch.no_grad():
+        logits = model(ids).logits[0].numpy().astype(np.float32)
+    out = {}
+    for k, v in sd.items():
+        k = (k.replace('self_attn.out_proj', 'self_attn.o_proj')
+              .replace('q_layernorm', 'q_norm')
+              .replace('k_layernorm', 'k_norm'))
+        if k.endswith('self_attn.o_proj.weight'):
+            v = v * 2   # exact in bf16
+        out[k] = v
+    for i, t in enumerate(layer_types):
+        if t != 'conv':
+            out['model.layers.%d.self_attn.gate_proj.weight' % i] = \
+                torch.zeros(cfg.num_attention_heads, cfg.hidden_size)
+    cfg_json = dict(kw, model_type='lfm3',
+                    architectures=['Lfm3ForCausalLM'],
+                    use_sandwich_norm=False, sliding_window=None,
+                    rope_parameters={'full_attention': {
+                        'rope_type': 'default', 'rope_theta': 10000.0}})
+    del cfg_json['block_auto_adjust_ff_dim']
+    _lfm3_dump('tiny_lfm3_via_lfm2.json', cfg_json, out, ids[0].tolist(),
+               logits, 'transformers %s Lfm2ForCausalLM'
+               % transformers.__version__)
+
+
+def lfm3_reference_forward(cfg, sd, ids):
+    '''LFM3's forward pass written out in PyTorch, transcribed from the
+    model repository's modeling_lfm3.py (revision 40ebe0a): whole-sequence
+    and unoptimised, sharing no code with tinygpt/hf/lfm3.py. Covers what
+    LFM2 lacks: sandwich norms, the per-head output gate, zero-tail
+    partial RoPE and sliding-window layers.'''
+    import torch
+    import torch.nn.functional as F
+    H, nh, nkv, hd = (cfg['hidden_size'], cfg['num_attention_heads'],
+                      cfg['num_key_value_heads'], cfg['head_dim'])
+    eps = cfg['norm_eps']
+    T = len(ids)
+
+    def norm(x, w):
+        return w * (x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps))
+
+    def rope(layer_type):
+        p = cfg['rope_parameters'][layer_type]
+        angles = int(p.get('partial_rotary_factor', 1.0) * hd) // 2
+        inv = 1.0 / (p['rope_theta'] ** (
+            torch.arange(0, 2 * angles, 2, dtype=torch.float) / hd))
+        inv = torch.cat((inv, torch.zeros(hd // 2 - angles)))
+        f = torch.arange(T, dtype=torch.float)[:, None] * inv[None]
+        emb = torch.cat((f, f), -1)
+        return emb.cos(), emb.sin()
+
+    def rot(x):
+        return torch.cat((-x[..., hd // 2:], x[..., :hd // 2]), -1)
+
+    x = sd['model.embed_tokens.weight'][torch.tensor(ids)]
+    for i, t in enumerate(cfg['layer_types']):
+        p = 'model.layers.%d.' % i
+        h = norm(x, sd[p + 'operator_norm.weight'])
+        if t == 'conv':
+            B, C, xx = (h @ sd[p + 'conv.in_proj.weight'].T).T.chunk(3, 0)
+            conv = F.conv1d((B * xx)[None], sd[p + 'conv.conv.weight'],
+                            padding=cfg['conv_L_cache'] - 1,
+                            groups=H)[0, :, :T]
+            y = (C * conv).T @ sd[p + 'conv.out_proj.weight'].T
+        else:
+            a = p + 'self_attn.'
+            q = norm((h @ sd[a + 'q_proj.weight'].T).view(T, nh, hd),
+                     sd[a + 'q_norm.weight']).transpose(0, 1)
+            k = norm((h @ sd[a + 'k_proj.weight'].T).view(T, nkv, hd),
+                     sd[a + 'k_norm.weight']).transpose(0, 1)
+            v = (h @ sd[a + 'v_proj.weight'].T).view(T, nkv, hd).transpose(
+                0, 1)
+            cos, sin = rope(t)
+            q, k = q * cos + rot(q) * sin, k * cos + rot(k) * sin
+            k = k.repeat_interleave(nh // nkv, 0)
+            v = v.repeat_interleave(nh // nkv, 0)
+            qi = torch.arange(T)[:, None]
+            ki = torch.arange(T)[None, :]
+            allowed = ki <= qi
+            if t == 'sliding_attention':
+                allowed &= ki > qi - cfg['sliding_window']
+            s = (q @ k.transpose(1, 2)) * hd ** -0.5
+            s = s.masked_fill(~allowed, float('-inf')).softmax(-1)
+            o = (s @ v).transpose(0, 1)
+            gate = torch.sigmoid(h @ sd[a + 'gate_proj.weight'].T)
+            o = (o * gate[..., None]).reshape(T, nh * hd)
+            y = o @ sd[a + 'o_proj.weight'].T
+        if cfg['use_sandwich_norm']:
+            y = norm(y, sd[p + 'post_operator_norm.weight'])
+        x = x + y
+        f = p + 'feed_forward.'
+        h = norm(x, sd[p + 'ffn_norm.weight'])
+        y = (F.silu(h @ sd[f + 'w1.weight'].T) * (h @ sd[f + 'w3.weight'].T)
+             ) @ sd[f + 'w2.weight'].T
+        if cfg['use_sandwich_norm']:
+            y = norm(y, sd[p + 'post_ffn_norm.weight'])
+        x = x + y
+    x = norm(x, sd['model.embedding_norm.weight'])
+    return x @ sd['model.embed_tokens.weight'].T
+
+
+def tiny_lfm3():
+    '''A tiny random LFM3 with every LFM3 feature, a sliding window of 5
+    over a 30-token sequence, and logits from lfm3_reference_forward().'''
+    import torch
+    torch.manual_seed(21)
+    layer_types = ['conv', 'sliding_attention', 'full_attention', 'conv',
+                   'sliding_attention', 'conv']
+    cfg = dict(LFM3_BASE, model_type='lfm3',
+               architectures=['Lfm3ForCausalLM'],
+               num_hidden_layers=len(layer_types), layer_types=layer_types,
+               use_sandwich_norm=True, sliding_window=5,
+               rope_parameters={
+                   'full_attention': {'rope_type': 'default',
+                                      'rope_theta': 1000000.0,
+                                      'partial_rotary_factor': 0.5},
+                   'sliding_attention': {'rope_type': 'default',
+                                         'rope_theta': 10000.0}})
+    H, I, nh, nkv, hd = 48, 96, 6, 2, 8
+    shapes = {'model.embed_tokens.weight': (160, H),
+              'model.embedding_norm.weight': (H,)}
+    for i, t in enumerate(layer_types):
+        p = 'model.layers.%d.' % i
+        for n in ('operator_norm', 'ffn_norm', 'post_operator_norm',
+                  'post_ffn_norm'):
+            shapes[p + n + '.weight'] = (H,)
+        shapes.update({p + 'feed_forward.w1.weight': (I, H),
+                       p + 'feed_forward.w3.weight': (I, H),
+                       p + 'feed_forward.w2.weight': (H, I)})
+        if t == 'conv':
+            shapes.update({p + 'conv.in_proj.weight': (3 * H, H),
+                           p + 'conv.conv.weight': (H, 1, 7),
+                           p + 'conv.out_proj.weight': (H, H)})
+        else:
+            a = p + 'self_attn.'
+            shapes.update({a + 'q_proj.weight': (nh * hd, H),
+                           a + 'k_proj.weight': (nkv * hd, H),
+                           a + 'v_proj.weight': (nkv * hd, H),
+                           a + 'o_proj.weight': (H, nh * hd),
+                           a + 'gate_proj.weight': (nh, H),
+                           a + 'q_norm.weight': (hd,),
+                           a + 'k_norm.weight': (hd,)})
+    sd = {}
+    for k in sorted(shapes):
+        v = torch.randn(shapes[k]) * 0.3
+        if 'norm' in k:
+            v += 1.0
+        sd[k] = v
+    sd = _bf16_round(sd)
+    g = torch.Generator().manual_seed(22)
+    ids = torch.randint(0, 160, (30,), generator=g).tolist()
+    with torch.no_grad():
+        logits = lfm3_reference_forward(cfg, sd, ids).numpy().astype(
+            np.float32)
+    _lfm3_dump('tiny_lfm3.json', cfg, sd, ids, logits,
+               'lfm3_reference_forward (tests/make_hf_fixtures.py)')
+
+
+def lfm3_tokens(model_dir):
+    from tokenizers import Tokenizer
+    ref = Tokenizer.from_file(os.path.join(model_dir, 'tokenizer.json'))
+    texts = TEXTS + NFC_TEXTS + random_texts(500, seed=5) + [
+        ' struc', '\tpubli', ' impleme', 'nclu tegory .loa',
+        '1234567 89 3.14159 ٣٤٥٦',
+        '<|startoftext|><|im_start|>user\nHi<|im_end|>\n<think>x</think>']
+    with open(os.path.join(HERE, 'make_hf_fixtures.py'), 'rb') as fh:
+        texts.append(fh.read().decode('utf-8'))
+    dump('lfm3_tokens.json', {'texts': texts,
+                              'ids': [ref.encode(t).ids for t in texts]})
+
+
 def main():
     os.makedirs(FIX, exist_ok=True)
+    args = sys.argv[1:]
+    lfm3_dir = None
+    for a in list(args):
+        if a.startswith('--lfm3='):
+            lfm3_dir = a.split('=', 1)[1]
+            args.remove(a)
+    if '--only-lfm3' in args:
+        args.remove('--only-lfm3')
+        tiny_lfm3_via_lfm2()
+        tiny_lfm3()
+        if lfm3_dir:
+            lfm3_tokens(lfm3_dir)
+        return
     safetensors_dtypes()
     base = dict(vocab_size=160, hidden_size=48, intermediate_size=96,
                 num_hidden_layers=3, num_attention_heads=6,
@@ -448,14 +698,18 @@ def main():
     bpe_tiny()
     bpe_tiny_qwen()
     chat_templates()
-    if len(sys.argv) > 1:
-        smollm2_tokens(sys.argv[1])
-        smollm2_logits(sys.argv[1])
-    if len(sys.argv) > 2:
-        qwen_tokens(sys.argv[2])
-        qwen_logits(sys.argv[2])
-    if len(sys.argv) > 3:
-        qwen_instruct_chat(sys.argv[3])
+    tiny_lfm3_via_lfm2()
+    tiny_lfm3()
+    if len(args) > 0:
+        smollm2_tokens(args[0])
+        smollm2_logits(args[0])
+    if len(args) > 1:
+        qwen_tokens(args[1])
+        qwen_logits(args[1])
+    if len(args) > 2:
+        qwen_instruct_chat(args[2])
+    if lfm3_dir:
+        lfm3_tokens(lfm3_dir)
 
 
 if __name__ == '__main__':

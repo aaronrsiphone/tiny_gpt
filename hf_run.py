@@ -36,6 +36,7 @@ import time
 # Edit these when running from Pythonista (no command-line arguments).
 
 MODEL_ID = 'HuggingFaceTB/SmolLM2-135M-Instruct'   # or a huggingface.co URL
+# Also: 'Qwen/Qwen2.5-Coder-1.5B-Instruct', 'LiquidAI/LFM3-1.7B' (3.5 GB)
 MODE = 'chat'           # download | chat | ask | complete | import |
                         # bench | selftest | info
 PROMPT = 'What is the capital of France?'   # for ask / complete
@@ -46,7 +47,8 @@ TEMPERATURE = None      # 0 = greedy (deterministic)
 TOP_K = None            # 0 = off
 TOP_P = None            # 1.0 = off
 REPETITION_PENALTY = None   # 1.0 = off
-CONTEXT_LIMIT = 1024    # tokens of KV cache; ~7 MB per 100 for SmolLM2-135M
+CONTEXT_LIMIT = 1024    # tokens of KV cache; ~7 MB per 100 for SmolLM2-135M,
+                        # ~15 MB per 100 for LFM3-1.7B
 WEIGHTS = 'auto'        # 'auto': lowmem with Accelerate (faster there);
                         #   elsewhere float32 for small models, else lowmem
                         # 'float32': widened once at load, 4 bytes/param
@@ -65,10 +67,16 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
 
+class RunError(Exception):
+    '''A problem to report to the user as a message. Never SystemExit:
+    in Pythonista that kills the interpreter instead of just stopping.'''
+
+
 def settings_from_argv(argv):
     import argparse
     p = argparse.ArgumentParser(
-        description='Offline inference for Hugging Face Llama models.')
+        description='Offline inference for Hugging Face models '
+                    '(Llama, Qwen2, LFM3).')
     p.add_argument('mode', choices=['download', 'chat', 'ask', 'complete',
                                     'import', 'bench', 'selftest', 'info'])
     p.add_argument('text', nargs='?', default=None,
@@ -216,7 +224,7 @@ def locate(s):
         if os.path.exists(cand):
             print('model not cached; importing %s' % os.path.basename(cand))
             return hub.import_local(cand, s['model'], s['cache'])
-    raise SystemExit(
+    raise RunError(
         '%s is not downloaded yet. Run once with a connection:\n'
         '    MODE = "download"   (or: python hf_run.py download)'
         % s['model'])
@@ -249,7 +257,8 @@ def resolve_weights(mode, cfg, have_bnns_copy=None):
 
 def load(s, quiet=False):
     from tinygpt import backend
-    from tinygpt.hf.llama import LlamaModel, UnsupportedModel
+    from tinygpt.hf.llama import UnsupportedModel
+    from tinygpt.hf.models import config_from_dict, model_from_dir
     from tinygpt.hf.safetensors import SafetensorsError
     from tinygpt.hf.tokenizer import BPETokenizer, ChatFormat
     import json
@@ -257,17 +266,16 @@ def load(s, quiet=False):
     with open(os.path.join(path, 'config.json'), 'rb') as f:
         raw_cfg = json.loads(f.read().decode('utf-8'))
     try:
-        from tinygpt.hf.llama import LlamaConfig
-        cfg = LlamaConfig(raw_cfg)
+        cfg = config_from_dict(raw_cfg)
     except UnsupportedModel as e:
-        raise SystemExit('unsupported model: %s' % e)
-    ctx = min(s['ctx'], cfg.max_pos, cfg.sliding_window or cfg.max_pos)
+        raise RunError('unsupported model: %s' % e)
+    ctx = min(s['ctx'], cfg.max_context)
     weights = resolve_weights(s['weights'], cfg)
     est = (cfg.n_params() * 4 if weights == 'float32' else 8 << 20) \
         + cfg.kv_bytes(ctx)
     if (weights == 'float32' and sys.platform == 'ios'
             and est > IOS_FLOAT32_MAX_MB << 20):
-        raise SystemExit(
+        raise RunError(
             'float32 weights for this model need about %d MB, more than '
             'iOS lets Pythonista use. Use WEIGHTS = "lowmem" (or "auto").'
             % (est >> 20))
@@ -280,16 +288,16 @@ def load(s, quiet=False):
                  'yes' if backend.HAVE_ACCELERATE else 'no (NumPy only)'))
     t0 = time.time()
     try:
-        model = LlamaModel.from_dir(path, ctx_limit=ctx, weights=weights)
+        model = model_from_dir(path, ctx_limit=ctx, weights=weights)
     except MemoryError:
-        raise SystemExit(
+        raise RunError(
             'out of memory loading the weights (needs about %d MB).\n'
             'Try WEIGHTS = "lowmem" and/or a smaller CONTEXT_LIMIT.'
             % (est >> 20))
     except UnsupportedModel as e:
-        raise SystemExit('unsupported model: %s' % e)
+        raise RunError('unsupported model: %s' % e)
     except SafetensorsError as e:
-        raise SystemExit('cannot load the weights: %s' % e)
+        raise RunError('cannot load the weights: %s' % e)
     t_load = time.time() - t0
     tok = BPETokenizer.from_dir(path)
     try:
@@ -441,7 +449,7 @@ def mode_import(s):
     from tinygpt.hf import hub
     src = s['source']
     if not src:
-        raise SystemExit('import needs a zip file or directory')
+        raise RunError('import needs a zip file or directory')
     if not os.path.isabs(src):
         src = os.path.join(os.getcwd(), src) if os.path.exists(src) \
             else os.path.join(HERE, src)
@@ -479,7 +487,7 @@ def mode_ask(s, raw=False):
 def mode_chat(s):
     model, tok, chat, stops, _ = load(s)
     if chat is None:
-        raise SystemExit('this model has no chat template; use complete')
+        raise RunError('this model has no chat template; use complete')
     print('\nchat with %s -- empty line or /quit to stop, /reset to clear'
           % s['model'].split('/')[-1])
     warn_base_model(model, s)
@@ -591,7 +599,7 @@ def mode_selftest(s):
     for w in ('lowmem', 'float32'):
         try:
             bench(dict(s, weights=w), tee)
-        except SystemExit as e:
+        except RunError as e:
             tee('bench %s skipped: %s' % (w, e))
         tee('')
     buf = io.StringIO()
@@ -606,6 +614,26 @@ def mode_selftest(s):
 
 
 def main(argv=None):
+    '''Run one mode; print errors instead of raising. Returns 0 on
+    success, 1 on a reported error.'''
+    try:
+        _main(argv)
+        return 0
+    except RunError as e:
+        print('\nerror: %s' % e)
+    except KeyboardInterrupt:
+        print('\n(stopped)')
+    except SystemExit:
+        pass       # argparse after --help or a bad option; already printed
+    except Exception as e:
+        from tinygpt.hf import hub
+        if not isinstance(e, hub.HubError):
+            raise
+        print('\nerror: %s' % e)
+    return 1
+
+
+def _main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
     s = settings_from_argv(argv) if argv else settings_from_globals()
     from tinygpt.hf import hub
@@ -615,11 +643,8 @@ def main(argv=None):
           'ask': mode_ask, 'complete': lambda s: mode_ask(s, raw=True),
           'bench': mode_bench, 'selftest': mode_selftest}.get(s['mode'])
     if fn is None:
-        raise SystemExit('unknown MODE %r' % s['mode'])
-    try:
-        fn(s)
-    except hub.HubError as e:
-        raise SystemExit('error: %s' % e)
+        raise RunError('unknown MODE %r' % s['mode'])
+    fn(s)
 
 
 if __name__ == '__main__':

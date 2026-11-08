@@ -302,8 +302,6 @@ def _check_model(m):
     if m.get('continuing_subword_prefix') or m.get('end_of_word_suffix'):
         raise UnsupportedTokenizer('BPE subword prefixes/suffixes are not '
                                    'supported')
-    if m.get('ignore_merges'):
-        raise UnsupportedTokenizer('BPE ignore_merges is not supported')
 
 
 # -------------------------------------------------------------- tokenizer
@@ -336,6 +334,7 @@ class BPETokenizer(object):
         self._steps = _compile_steps(steps)
 
         self.token_to_id = {t: int(i) for t, i in m['vocab'].items()}
+        self.ignore_merges = bool(m.get('ignore_merges'))
         self.added = {}
         self.special_ids = set()
         for a in spec.get('added_tokens', ()):
@@ -352,6 +351,7 @@ class BPETokenizer(object):
             self.token_to_id[a['content']] = int(a['id'])
             if a.get('special'):
                 self.special_ids.add(int(a['id']))
+        self._added_only = set(self.added) - set(m['vocab'])
         self.id_to_token = {i: t for t, i in self.token_to_id.items()}
         self.vocab_size = max(self.id_to_token) + 1
 
@@ -432,8 +432,17 @@ class BPETokenizer(object):
         ids = self._cache.get(word)
         if ids is not None:
             return ids
-        sym = [self.token_to_id.get(BYTE_ENCODER[b])
-               for b in word.encode('utf-8')]
+        chars = [BYTE_ENCODER[b] for b in word.encode('utf-8')]
+        if self.ignore_merges:
+            # A word that is itself in the model's vocabulary becomes that
+            # one token without running the merges (added tokens that
+            # aren't also in the model vocabulary don't count).
+            w = ''.join(chars)
+            i = self.token_to_id.get(w)
+            if i is not None and w not in self._added_only:
+                self._cache[word] = [i]
+                return [i]
+        sym = [self.token_to_id.get(c) for c in chars]
         sym = [s for s in sym if s is not None]
         n = len(sym)
         if n == 0:
