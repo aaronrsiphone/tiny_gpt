@@ -434,6 +434,38 @@ def fit_history(model, tok, chat, s, history):
         history = history[2:]
 
 
+def open_chat_engine(model_id=None, ctx=4096, weights=None, max_new=1024,
+                     enable_thinking=None, quiet=True, **overrides):
+    '''Load a chat model for use from another program, such as an agent
+    harness: returns a tinygpt.hf.chat_api.ChatEngine, whose chat() takes
+    OpenAI-style messages and tool schemas and returns an OpenAI-style
+    response. Raises RunError (model not downloaded, unsupported, no chat
+    template). Never touches the network.
+
+    overrides are settings as in settings_from_globals(): temp, top_k,
+    top_p, rep, seed, cache, revision.
+    '''
+    from tinygpt.hf import hub
+    from tinygpt.hf.chat_api import ChatEngine
+    s = settings_from_globals()
+    s.update(overrides)
+    s['model'] = hub.normalize_repo_id(model_id or s['model'])
+    s['ctx'] = int(ctx)
+    s['max_new'] = int(max_new)
+    if weights:
+        s['weights'] = weights
+    model, tok, chat, stops, _ = load(s, quiet=quiet)
+    if chat is None:
+        raise RunError('%s has no chat template, so it cannot drive an '
+                       'agent' % s['model'])
+    if chat.engine != 'jinja2':
+        raise RunError('describing tools to the model needs jinja2')
+    sampling, _ = sampling_settings(s, model.generation_config)
+    return ChatEngine(model, tok, chat, stops, sampling, name=s['model'],
+                      max_tokens=s['max_new'],
+                      enable_thinking=enable_thinking, seed=s['seed'])
+
+
 # ------------------------------------------------------------------ modes
 
 def mode_download(s):

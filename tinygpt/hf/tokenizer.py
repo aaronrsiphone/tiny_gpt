@@ -597,6 +597,15 @@ def _compile_template(template, now):
         trim_blocks=True, lstrip_blocks=True,
         extensions=[GenerationTag, loopcontrols])
     env.filters['tojson'] = tojson
+    # Tests that jinja2 only gained in 2.11; LFM3's template uses them to
+    # write tool-call arguments.
+    for name, test in (
+            ('boolean', lambda v: v is True or v is False),
+            ('true', lambda v: v is True), ('false', lambda v: v is False),
+            ('integer', lambda v: isinstance(v, int)
+             and not isinstance(v, bool)),
+            ('float', lambda v: isinstance(v, float))):
+        env.tests.setdefault(name, test)
     env.globals['raise_exception'] = raise_exception
     env.globals['strftime_now'] = lambda fmt: now().strftime(fmt)
     return env.from_string(template), jinja2.exceptions.TemplateError
@@ -644,9 +653,10 @@ class ChatFormat(object):
 
     With jinja2 (Pythonista ships it) the template itself is rendered,
     in the same sandbox and with the same variables as transformers'
-    apply_chat_template: messages, add_generation_prompt, tools=None,
-    documents=None, the special tokens by name, plus any extra keyword
-    arguments the template reads (e.g. enable_thinking=False).
+    apply_chat_template: messages, add_generation_prompt, tools (function
+    schemas, for templates that describe them to the model), documents=None,
+    the special tokens by name, plus any extra keyword arguments the
+    template reads (e.g. enable_thinking=False).
 
     Without jinja2, a known plain ChatML template (SmolLM2's) is rendered
     by hand, and any other template is refused.
@@ -682,16 +692,20 @@ class ChatFormat(object):
                 'jinja2); use completion mode')
         self.engine = 'chatml'
 
-    def render(self, messages, add_generation_prompt=True, **kwargs):
+    def render(self, messages, add_generation_prompt=True, tools=None,
+               **kwargs):
         if self._jinja is not None:
             ctx = dict(self.special_tokens)
             ctx.update(kwargs)
             try:
                 return self._jinja.render(
-                    messages=messages, tools=None, documents=None,
+                    messages=messages, tools=tools or None, documents=None,
                     add_generation_prompt=add_generation_prompt, **ctx)
             except self._TemplateError as e:
                 raise ValueError('chat template: %s' % e)
+        if tools:
+            raise ValueError('tool definitions need jinja2 and a template '
+                             'that describes them')
         if kwargs:
             raise ValueError('template options %s need jinja2'
                              % ', '.join(sorted(kwargs)))
