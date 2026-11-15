@@ -114,13 +114,13 @@ becomes `reasoning_content`.
 
 The engine keeps the KV cache between calls. In an agent loop each step
 sends the whole conversation again, and only the tokens after the cached
-prefix are computed: with miniagent's 2,600-token system prompt and tool
-list, the first call reads 2,600 tokens and later steps typically 25 to
+prefix are computed: with miniagent's 1,600-token system prompt and tool
+list, the first call reads 1,600 tokens and later steps typically 25 to
 400. A conversation that outgrows the context loses its oldest tool
 results, then its oldest turns.
 
 Measured on the 4-vCPU Linux container (float32, no Accelerate), LFM3-1.7B
-driving miniagent: the first prompt takes about 40 s to read, then steps
+driving miniagent: the first prompt takes about 25 s to read, then steps
 run at about 5 tok/s. It listed a project, read files and answered from
 them, and fixed a one-line bug, wrote a test for it and ran it (about
 4 minutes). Not yet measured on an iPhone.
