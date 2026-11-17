@@ -88,6 +88,43 @@ The capital of France is Paris.
 [37 prompt tokens in 0.14s, 7 new at 42.5 tok/s]
 ```
 
+## Driving an agent
+
+`tinygpt/hf/chat_api.py` answers OpenAI-style chat-completion requests,
+tool calls included, from a model loaded in the same process. It is what
+lets [Jeb's miniagent](https://github.com/aaronrsiphone/jeb_for_pythonista)
+run on LFM3-1.7B with nothing leaving the phone (there, add a provider
+with the base URL `tinygpt://`; see its README).
+
+```python
+import hf_run
+engine = hf_run.open_chat_engine('LiquidAI/LFM3-1.7B', ctx=4096)
+reply = engine.chat(messages, tools=tool_schemas)
+message = reply['choices'][0]['message']
+# message['content'], message['reasoning_content'], message['tool_calls']
+```
+
+The messages are rendered with the model's own chat template, which also
+describes the tools to the model. LFM3 writes a call as
+`<tool_call><function=NAME><parameter=ARG>value</parameter></function>
+</tool_call>`; that is parsed back into `tool_calls`, with each value typed
+by the tool's schema. Qwen's JSON form of `<tool_call>` is parsed too, but
+has only been tested on the parser, not on a model. `<think>...</think>`
+becomes `reasoning_content`.
+
+The engine keeps the KV cache between calls. In an agent loop each step
+sends the whole conversation again, and only the tokens after the cached
+prefix are computed: with miniagent's 1,600-token system prompt and tool
+list, the first call reads 1,600 tokens and later steps typically 25 to
+400. A conversation that outgrows the context loses its oldest tool
+results, then its oldest turns.
+
+Measured on the 4-vCPU Linux container (float32, no Accelerate), LFM3-1.7B
+driving miniagent: the first prompt takes about 25 s to read, then steps
+run at about 5 tok/s. It listed a project, read files and answered from
+them, and fixed a one-line bug, wrote a test for it and ran it (about
+4 minutes). Not yet measured on an iPhone.
+
 ## What is in `tinygpt/hf/`
 
 | File | Contents |
@@ -97,6 +134,7 @@ The capital of France is Paris.
 | `tokenizer.py` | Byte-level BPE from `tokenizer.json`: added/special tokens, NFC normalization, the Digits, Split (regex translated to Python's `re`) and ByteLevel pre-tokenizers, and the same priority-queue merge order as the Rust library. Includes a streaming UTF-8 decoder and the chat template, rendered in Jinja2's sandbox exactly as transformers does it. Configurations it doesn't implement exactly are refused at load. |
 | `unicode_tables.py` | `\p{L}`, `\p{N}`, `\s` and Rust `is_numeric` as codepoint ranges, measured from the reference `tokenizers` library (`tools/gen_unicode_tables.py`). It also lists the combining marks that library's older NFC tables leave alone. This keeps tokenization from drifting with Pythonista's Unicode database. |
 | `models.py` | Picks the forward pass for a `config.json` by `model_type`. |
+| `chat_api.py` | Chat completions with tool calling in the OpenAI shape, for agent harnesses (see Driving an agent). |
 | `lfm3.py` | LFM3: a hybrid of gated short convolutions (kernel 7) and grouped-query attention with QK-norm, a sigmoid gate per head, sandwich norms, "zero-tail" partial RoPE on full-attention layers and a 256-token window on sliding-attention layers. Reuses `llama.py`'s matrix products, weight modes and sampler. The cache keeps every position's conv input, so a chat can rewind to any earlier point and reuse the shared prefix. |
 | `llama.py` | The model (Llama and Qwen2): RMSNorm, rotate-half RoPE (including `linear`/`llama3` scaling), grouped-query attention, a preallocated KV cache, SwiGLU, tied or untied heads, and per-projection biases (Qwen2's q/k/v). All dimensions come from `config.json`, in either the transformers 4 or 5 layout. Prompts are prefilled with matrix-matrix products and decoding uses matrix-vector products. Also contains the sampler (greedy, temperature, top-k, top-p, repetition penalty). |
 
@@ -251,7 +289,7 @@ Pythonista, because its interpreter stays alive between runs.
   never takes effect.
 - Chat templates are rendered with jinja2 (Pythonista ships it). Without
   jinja2, only plain ChatML templates like SmolLM2's work, and others are
-  refused. Tool definitions (`tools=`) aren't passed to templates yet.
+  refused, as are tool definitions (`tools=`).
 - Float32 compute throughout. Weights stay BF16 only in `lowmem` mode, and
   there's no int8/4-bit quantization.
 - The context is a hard limit (`CONTEXT_LIMIT`, default 1024). Generation
