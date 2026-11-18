@@ -36,7 +36,8 @@ import time
 # Edit these when running from Pythonista (no command-line arguments).
 
 MODEL_ID = 'HuggingFaceTB/SmolLM2-135M-Instruct'   # or a huggingface.co URL
-# Also: 'Qwen/Qwen2.5-Coder-1.5B-Instruct', 'LiquidAI/LFM3-1.7B' (3.5 GB)
+# Also: 'Qwen/Qwen2.5-Coder-1.5B-Instruct', 'LiquidAI/LFM3-1.7B' (3.5 GB),
+# 'AuroraAI-Research/Aurora2-400M-A20M' (base model, 1.6 GB, MODE 'complete')
 MODE = 'chat'           # download | chat | ask | complete | import |
                         # bench | selftest | info
 PROMPT = 'What is the capital of France?'   # for ask / complete
@@ -76,7 +77,7 @@ def settings_from_argv(argv):
     import argparse
     p = argparse.ArgumentParser(
         description='Offline inference for Hugging Face models '
-                    '(Llama, Qwen2, LFM3).')
+                    '(Llama, Qwen2, LFM3, Aurora2).')
     p.add_argument('mode', choices=['download', 'chat', 'ask', 'complete',
                                     'import', 'bench', 'selftest', 'info'])
     p.add_argument('text', nargs='?', default=None,
@@ -505,7 +506,7 @@ def mode_info(s):
 def mode_ask(s, raw=False):
     model, tok, chat, stops, _ = load(s)
     if raw or chat is None:
-        ids = tok.encode(s['prompt'])
+        ids = tok.encode(s['prompt'], add_special_tokens=True)
         sys.stdout.write(s['prompt'])
     else:
         warn_base_model(model, s)
@@ -575,7 +576,7 @@ def bench(s, out=print):
                            'Explain in a few sentences how rainbows form, '
                            'and why the colours always appear in the same '
                            'order.'}]) if chat else 'Rainbows form when'
-    ids = tok.encode(prompt)
+    ids = tok.encode(prompt, add_special_tokens=chat is None)
     for run in range(2):
         cache = model.new_cache()
         res, reason, st = generate(model, cache, ids, 64, Sampler(0.0),

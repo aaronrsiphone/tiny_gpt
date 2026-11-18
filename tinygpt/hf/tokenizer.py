@@ -304,6 +304,38 @@ def _check_model(m):
                                    'supported')
 
 
+def _post_processor(pp):
+    '''(ids before, ids after) the text that the post-processor adds for a
+    single sequence. ByteLevel adds none. TemplateProcessing is supported
+    for the plain "<special tokens> $A <special tokens>" form (Aurora2:
+    just a BOS in front); pairs are not used here.'''
+    if pp is None or pp.get('type') == 'ByteLevel':
+        return [], []
+    if pp.get('type') != 'TemplateProcessing':
+        raise UnsupportedTokenizer('post-processor %r is not supported'
+                                   % pp.get('type'))
+    before, after, seen = [], [], False
+    for item in pp.get('single') or ():
+        if 'Sequence' in item:
+            if seen or item['Sequence'].get('id') != 'A':
+                raise UnsupportedTokenizer('post-processor template is not '
+                                           'a single sequence A')
+            seen = True
+        elif 'SpecialToken' in item:
+            name = item['SpecialToken'].get('id')
+            sp = (pp.get('special_tokens') or {}).get(name)
+            if not sp or not sp.get('ids'):
+                raise UnsupportedTokenizer('post-processor special token %r '
+                                           'is not defined' % (name,))
+            (after if seen else before).extend(int(i) for i in sp['ids'])
+        else:
+            raise UnsupportedTokenizer('post-processor template item %r is '
+                                       'not supported' % (item,))
+    if not seen:
+        raise UnsupportedTokenizer('post-processor template has no $A')
+    return before, after
+
+
 # -------------------------------------------------------------- tokenizer
 
 class BPETokenizer(object):
@@ -319,10 +351,8 @@ class BPETokenizer(object):
     def __init__(self, spec, config=None):
         config = config or {}
         self.normalize = _normalizer(spec.get('normalizer'))
-        pp = spec.get('post_processor')
-        if pp is not None and pp.get('type') != 'ByteLevel':
-            raise UnsupportedTokenizer(
-                'post-processor %r is not supported' % pp.get('type'))
+        self.prefix_ids, self.suffix_ids = _post_processor(
+            spec.get('post_processor'))
         dec = spec.get('decoder')
         if dec is not None and dec.get('type') != 'ByteLevel':
             raise UnsupportedTokenizer('decoder %r is not supported'
@@ -493,9 +523,21 @@ class BPETokenizer(object):
         for w in self._words(text):
             out.extend(self._bpe(w))
 
-    def encode(self, text, allow_special=True):
+    def encode(self, text, allow_special=True, add_special_tokens=False):
         '''Text -> ids. With allow_special, added-token strings in the text
-        become their ids, exactly as `tokenizers` does by default.'''
+        become their ids, exactly as `tokenizers` does by default.
+
+        add_special_tokens adds what the post-processor would (Aurora2: a
+        BOS in front), as `tokenizers` does by default. It is off here
+        because callers encode rendered chat templates and fragments of
+        them, which carry their own special tokens; use it for a raw
+        prompt.'''
+        ids = self._encode(text, allow_special)
+        if add_special_tokens and (self.prefix_ids or self.suffix_ids):
+            return self.prefix_ids + ids + self.suffix_ids
+        return ids
+
+    def _encode(self, text, allow_special):
         out = []
         if not allow_special or self._added_re is None:
             self._encode_plain(text, out)

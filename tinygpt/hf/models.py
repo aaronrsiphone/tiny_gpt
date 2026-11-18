@@ -10,9 +10,11 @@ from tinygpt.hf.llama import LlamaConfig, LlamaModel, UnsupportedModel
 
 
 def _families():
+    from tinygpt.hf.aurora2 import Aurora2Config, Aurora2Model
     from tinygpt.hf.lfm3 import Lfm3Config, Lfm3Model
     fam = {t: (LlamaConfig, LlamaModel) for t in LlamaConfig.SUPPORTED_TYPES}
     fam['lfm3'] = (Lfm3Config, Lfm3Model)
+    fam['aurora2'] = (Aurora2Config, Aurora2Model)
     return fam
 
 

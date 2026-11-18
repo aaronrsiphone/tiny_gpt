@@ -1,6 +1,6 @@
 # Hugging Face inference
 
-Run pretrained Hugging Face models (Llama, Qwen2 and LFM3 families) offline on NumPy
+Run pretrained Hugging Face models (Llama, Qwen2, LFM3 and Aurora2 families) offline on NumPy
 and Accelerate, from a laptop to an iPhone in Pythonista. The code lives in
 this folder (`tinygpt/hf/`) and is driven by `hf_run.py` at the repository
 root. It shares only the BLAS bindings in `tinygpt/backend.py` with the
@@ -22,8 +22,10 @@ identical greedy output):
 | [Qwen/Qwen2.5-Coder-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct) | Qwen2 | lowmem | not yet measured |
 | [Qwen/Qwen2.5-Coder-1.5B](https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B) | Qwen2 | lowmem | not yet measured |
 | [LiquidAI/LFM3-1.7B](https://huggingface.co/LiquidAI/LFM3-1.7B) | LFM3 | lowmem | not yet measured (see the note below) |
+| [AuroraAI-Research/Aurora2-400M-A20M](https://huggingface.co/AuroraAI-Research/Aurora2-400M-A20M) | Aurora2 (top-1 MoE) | lowmem | not yet measured; ~68 tok/s on the Linux container (lowmem, NumPy only). Base model: use `complete`, not `chat` |
 
-LFM3 is the exception to "verified against transformers". transformers
+LFM3 and Aurora2 are the exceptions to "verified against transformers".
+For Aurora2, see the Verification section. transformers
 has no built-in `lfm3`; the only reference is the model repository's own
 `modeling_lfm3.py`, which would have to run with `trust_remote_code`, and
 that wasn't done. Instead the conv/attention/norm parts are checked
@@ -136,6 +138,7 @@ them, and fixed a one-line bug, wrote a test for it and ran it (about
 | `models.py` | Picks the forward pass for a `config.json` by `model_type`. |
 | `chat_api.py` | Chat completions with tool calling in the OpenAI shape, for agent harnesses (see Driving an agent). |
 | `lfm3.py` | LFM3: a hybrid of gated short convolutions (kernel 7) and grouped-query attention with QK-norm, a sigmoid gate per head, sandwich norms, "zero-tail" partial RoPE on full-attention layers and a 256-token window on sliding-attention layers. Reuses `llama.py`'s matrix products, weight modes and sampler. The cache keeps every position's conv input, so a chat can rewind to any earlier point and reuse the shared prefix. |
+| `aurora2.py` | Aurora2: a small top-1 mixture-of-experts model (32 experts plus a shared one per layer, about 19M of 400M parameters used per token) with hashed n-gram embeddings, an embedding skip into every block, value residuals, a sigmoid-gated output per attention head and a logit softcap. Every expert is its own matrix, so in lowmem mode a token only widens the one expert it was routed to. Reuses `llama.py`'s matrix products, weight modes and sampler. |
 | `llama.py` | The model (Llama and Qwen2): RMSNorm, rotate-half RoPE (including `linear`/`llama3` scaling), grouped-query attention, a preallocated KV cache, SwiGLU, tied or untied heads, and per-projection biases (Qwen2's q/k/v). All dimensions come from `config.json`, in either the transformers 4 or 5 layout. Prompts are prefilled with matrix-matrix products and decoding uses matrix-vector products. Also contains the sampler (greedy, temperature, top-k, top-p, repetition penalty). |
 
 Design points:
@@ -217,6 +220,21 @@ against fixtures produced by the official libraries
   real 1.7B model's parameter count matches the repository's, and it answers
   sensibly in chat (it multiplies correctly and recalls a code from 600
   tokens earlier).
+- **Aurora2-400M-A20M**: tokenizer ids (BOS added by its
+  `TemplateProcessing` post-processor, individual digits) identical to
+  `tokenizers` on 500+ texts. transformers has no built-in `aurora2` and
+  the repository's `modeling_aurora2.py` needs `trust_remote_code`, which
+  was not run. Instead `tests/make_hf_fixtures.py` holds an unoptimised
+  PyTorch transcription of it. A tiny random Aurora2 with every feature
+  (n-gram hashes, embedding skip, value residual, head gate, five routed
+  experts, a softcap that bites) matches it in both weight modes, for
+  prefill at several chunk sizes and for cached decoding, including after
+  `feed()` rewinds the cache. On the real checkpoint the transcription and
+  this code agree to ~5e-5 on logits over 300 tokens (identical argmax at
+  every position, both weight modes), and the parameter counts match the
+  model card exactly (399,597,454 total, 19,050,382 active). It is a base
+  model: it continues text sensibly ("The capital of France is the city of
+  Paris, ...") but does not follow instructions.
 - **SmolLM2-135M-Instruct**: logits match `transformers` float32 to <1e-4
   at every prompt position, and a 48-token greedy decode is token-for-token
   identical. Inference runs with sockets disabled to prove it's offline.
@@ -274,11 +292,16 @@ Pythonista, because its interpreter stays alive between runs.
 
 ## Limitations
 
-- Llama, Qwen2 and LFM3 architectures only (`LlamaForCausalLM`,
-  `Qwen2ForCausalLM`, `Lfm3ForCausalLM`; SiLU, no `pretraining_tp`; LFM3
-  without `conv_bias` and with `default` RoPE). Others fail with a clear
+- Llama, Qwen2, LFM3 and Aurora2 architectures only (`LlamaForCausalLM`,
+  `Qwen2ForCausalLM`, `Lfm3ForCausalLM`, `Aurora2ForCausalLM`; SiLU, no
+  `pretraining_tp`; LFM3 without `conv_bias` and with `default` RoPE). Others fail with a clear
   `unsupported model` error. So do tokenizers that aren't byte-level BPE
   (SentencePiece, byte fallback) or need a normalizer other than NFC.
+- Aurora2-400M-A20M has no chat template (`chat` refuses it; use `complete`
+  or `ask`, which add its BOS token). The downloader fetches the root
+  `model.safetensors` (float32, 1.6 GB); the repository's smaller `bf16/`
+  and `fp16/` copies sit in subfolders, which the downloader's
+  plain-filename allowlist does not fetch.
 - LFM3-1.7B is 3.5 GB of BF16 weights (6.9 GB in float32), so on a phone
   it runs in lowmem mode only. Its cache costs about 148 KB per token (keys and
   values for 11 attention layers, conv input for 13), so a 1024-token
