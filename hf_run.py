@@ -18,7 +18,10 @@ same settings are command-line options:
     options: --model ID  --max-new N  --temp T  --top-k K  --top-p P
              --rep-penalty R
              --ctx N  --weights float32|lowmem  --seed S  --system TEXT
-             --cache DIR  --report FILE
+             --cache DIR  --report FILE  --subfolder DIR
+
+--subfolder picks a model directory inside the repo, e.g. bf16 for
+Aurora2-400M-A20M's half-size weights; give it to every command.
 
 Download once with a connection; every other mode reads only the local
 cache (hf_models/ next to this script) and never touches the network.
@@ -57,6 +60,8 @@ WEIGHTS = 'auto'        # 'auto': lowmem with Accelerate (faster there);
                         #           against the app), widened as used
 SYSTEM_PROMPT = None    # None = the model's own default
 SEED = 0
+SUBFOLDER = None        # a directory inside the repo that holds the model,
+                        # e.g. 'bf16' for Aurora2 (half the download)
 CACHE_DIR = None        # None = hf_models/ next to this script
 IMPORT_SOURCE = None    # zip or directory for MODE = 'import'
 REPORT_FILE = 'hf_report.txt'   # written by bench / selftest
@@ -95,6 +100,8 @@ def settings_from_argv(argv):
     p.add_argument('--system', default=SYSTEM_PROMPT)
     p.add_argument('--cache', default=CACHE_DIR)
     p.add_argument('--revision', default='main')
+    p.add_argument('--subfolder', default=SUBFOLDER,
+                   help='model directory inside the repo, e.g. bf16')
     p.add_argument('--report', default=REPORT_FILE)
     a = p.parse_args(argv)
     return {
@@ -103,6 +110,7 @@ def settings_from_argv(argv):
         'rep': a.rep_penalty,
         'weights': a.weights, 'seed': a.seed, 'system': a.system,
         'cache': a.cache, 'revision': a.revision, 'report': a.report,
+        'subfolder': a.subfolder,
         'prompt': a.text if a.mode in ('ask', 'complete') else PROMPT,
         'source': a.text if a.mode == 'import' else IMPORT_SOURCE,
     }
@@ -115,6 +123,7 @@ def settings_from_globals():
         'rep': REPETITION_PENALTY,
         'ctx': CONTEXT_LIMIT, 'weights': WEIGHTS, 'seed': SEED,
         'system': SYSTEM_PROMPT, 'cache': CACHE_DIR, 'revision': 'main',
+        'subfolder': SUBFOLDER,
         'report': REPORT_FILE, 'prompt': PROMPT, 'source': IMPORT_SOURCE,
     }
 
@@ -217,18 +226,21 @@ def locate(s):
     '''The local snapshot for the model, importing a zip if one is next to
     this script. Never touches the network.'''
     from tinygpt.hf import hub
-    path = hub.find_local(s['model'], s['cache'], s['revision'])
+    path = hub.find_local(s['model'], s['cache'], s['revision'],
+                          s.get('subfolder'))
     if path:
         return path
     base = s['model'].split('/')[-1]
     for cand in (os.path.join(HERE, base + '.zip'), os.path.join(HERE, base)):
         if os.path.exists(cand):
             print('model not cached; importing %s' % os.path.basename(cand))
-            return hub.import_local(cand, s['model'], s['cache'])
+            return hub.import_local(cand, s['model'], s['cache'],
+                                    subfolder=s.get('subfolder'))
     raise RunError(
         '%s is not downloaded yet. Run once with a connection:\n'
         '    MODE = "download"   (or: python hf_run.py download)'
-        % s['model'])
+        % (s['model'] + ('/' + s['subfolder'] if s.get('subfolder')
+                         else '')))
 
 
 # 'auto' picks lowmem whenever BF16 is widened by BNNSCopy: on an iPhone 16
@@ -471,9 +483,12 @@ def open_chat_engine(model_id=None, ctx=4096, weights=None, max_new=1024,
 
 def mode_download(s):
     from tinygpt.hf import hub
-    print('downloading %s into %s' % (s['model'],
-                                      s['cache'] or hub.default_cache_dir()))
-    path = hub.snapshot_download(s['model'], s['revision'], s['cache'])
+    sub = s.get('subfolder')
+    print('downloading %s%s into %s' % (
+        s['model'], '/' + sub if sub else '',
+        s['cache'] or hub.default_cache_dir()))
+    path = hub.snapshot_download(s['model'], s['revision'], s['cache'],
+                                 subfolder=sub)
     print('ready: %s' % path)
     print('You can now go offline and use MODE = "chat".')
 
@@ -486,13 +501,15 @@ def mode_import(s):
     if not os.path.isabs(src):
         src = os.path.join(os.getcwd(), src) if os.path.exists(src) \
             else os.path.join(HERE, src)
-    path = hub.import_local(src, s['model'], s['cache'])
+    path = hub.import_local(src, s['model'], s['cache'],
+                            subfolder=s.get('subfolder'))
     print('imported into %s' % path)
 
 
 def mode_info(s):
     from tinygpt.hf import hub
-    path = hub.find_local(s['model'], s['cache'], s['revision'])
+    path = hub.find_local(s['model'], s['cache'], s['revision'],
+                          s.get('subfolder'))
     if not path:
         print('%s: not cached' % s['model'])
         return

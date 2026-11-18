@@ -51,6 +51,8 @@ SHARD_RE = re.compile(r'^model-\d{5}-of-\d{5}\.safetensors$')
 UNSAFE_WEIGHTS = ('.bin', '.pt', '.pth', '.ckpt', '.pkl', '.pickle')
 REPO_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,95}'
                      r'/[A-Za-z0-9][A-Za-z0-9._-]{0,95}$')
+SUBFOLDER_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,63}'
+                          r'(/[A-Za-z0-9][A-Za-z0-9._-]{0,63}){0,3}$')
 REV_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$')
 
 CHUNK = 1 << 20          # hashing / copying
@@ -105,10 +107,26 @@ def check_filename(name):
     return name
 
 
-def repo_dir(repo_id, cache_dir=None):
+def check_subfolder(subfolder):
+    '''A plain directory path inside the repo (e.g. "bf16"), or None.'''
+    if not subfolder:
+        return None
+    subfolder = subfolder.strip('/')
+    if not SUBFOLDER_RE.match(subfolder) or '..' in subfolder:
+        raise HubError('not a repository subfolder: %r (expected e.g. '
+                       '"bf16")' % (subfolder,))
+    return subfolder
+
+
+def repo_dir(repo_id, cache_dir=None, subfolder=None):
+    '''Where a repo (or one of its subfolders, which is a model of its own
+    with its own config, tokenizer and weights) is cached.'''
     check_repo_id(repo_id)
-    return os.path.join(cache_dir or default_cache_dir(),
-                        repo_id.replace('/', '--'))
+    sub = check_subfolder(subfolder)
+    name = repo_id.replace('/', '--')
+    if sub:
+        name += '@' + sub.replace('/', '--')
+    return os.path.join(cache_dir or default_cache_dir(), name)
 
 
 # ----------------------------------------------------------------- hashing
@@ -363,13 +381,32 @@ def _write_ref(rdir, revision, commit):
         f.write(commit)
 
 
+def in_subfolder(files, subfolder):
+    '''The repo listing as seen from inside `subfolder`: its direct
+    children, under their bare names.'''
+    prefix = subfolder + '/'
+    out = dict((n[len(prefix):], v) for n, v in files.items()
+               if n.startswith(prefix) and '/' not in n[len(prefix):])
+    if not out:
+        raise HubError('the repo has no files in %r' % (subfolder,))
+    return out
+
+
 def snapshot_download(repo_id, revision='main', cache_dir=None,
-                      progress=None, token=None, endpoint=ENDPOINT):
-    '''Download (or reuse) the inference files; return the local path.'''
+                      progress=None, token=None, endpoint=ENDPOINT,
+                      subfolder=None):
+    '''Download (or reuse) the inference files; return the local path.
+
+    With subfolder (say "bf16"), the model is the one in that directory of
+    the repo: its config.json, tokenizer and weights are fetched and cached
+    apart from the repo's top-level model.'''
     progress = progress or Progress()
-    rdir = repo_dir(repo_id, cache_dir)
+    sub = check_subfolder(subfolder)
+    rdir = repo_dir(repo_id, cache_dir, sub)
     s = _session(token)
     info = repo_info(repo_id, revision, s, endpoint)
+    if sub:
+        info['files'] = in_subfolder(info['files'], sub)
     commit = info['sha']
     snap = os.path.join(rdir, commit)
     if is_complete(snap):
@@ -392,7 +429,8 @@ def snapshot_download(repo_id, revision='main', cache_dir=None,
                 return dest
             except HubError:
                 os.remove(dest)
-        url = '%s/%s/resolve/%s/%s' % (endpoint, repo_id, commit, name)
+        url = '%s/%s/resolve/%s/%s%s' % (endpoint, repo_id, commit,
+                                         sub + '/' if sub else '', name)
         download_file(s, url, dest, spec, progress)
         specs[name] = spec
         return dest
@@ -406,7 +444,8 @@ def snapshot_download(repo_id, revision='main', cache_dir=None,
     from tinygpt.hf.safetensors import Checkpoint
     Checkpoint(snap).close()
     _write_manifest(snap, repo_id, commit, specs,
-                    '%s/%s@%s' % (endpoint, repo_id, revision))
+                    '%s/%s@%s%s' % (endpoint, repo_id, revision,
+                                    '/' + sub if sub else ''))
     _write_ref(rdir, revision, commit)
     return snap
 
@@ -441,9 +480,9 @@ def verify_snapshot(snap):
     return sorted(files)
 
 
-def find_local(repo_id, cache_dir=None, revision='main'):
+def find_local(repo_id, cache_dir=None, revision='main', subfolder=None):
     '''The cached snapshot for repo_id, without touching the network.'''
-    rdir = repo_dir(repo_id, cache_dir)
+    rdir = repo_dir(repo_id, cache_dir, subfolder)
     ref = os.path.join(rdir, 'refs', revision.replace('/', '--'))
     cands = []
     if os.path.exists(ref):
@@ -461,7 +500,8 @@ def find_local(repo_id, cache_dir=None, revision='main'):
     return None
 
 
-def import_local(source, repo_id, cache_dir=None, progress=None):
+def import_local(source, repo_id, cache_dir=None, progress=None,
+                 subfolder=None):
     '''Copy a model from a local directory or .zip into the cache.
 
     For when the files arrived some other way (a git-lfs checkout, AirDrop,
@@ -470,7 +510,7 @@ def import_local(source, repo_id, cache_dir=None, progress=None):
     so verify_snapshot() can catch later corruption.
     '''
     progress = progress or Progress()
-    rdir = repo_dir(repo_id, cache_dir)
+    rdir = repo_dir(repo_id, cache_dir, subfolder)
     if zipfile.is_zipfile(source):
         zf = zipfile.ZipFile(source)
         members = {}

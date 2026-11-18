@@ -180,6 +180,43 @@ class SnapshotTest(unittest.TestCase):
         LlamaModel.from_dir(snap, ctx_limit=16)
         self.fake = FakeHub({})                           # for tearDown
 
+    def test_subfolder(self):
+        # A repo whose root and bf16/ directory each hold a model.
+        for n in ('config.json', 'tokenizer.json', 'model.safetensors'):
+            self.fake.files['bf16/' + n] = self.files[n]
+        self.fake.files['bf16/model.safetensors'] += b''
+        self.fake.lfs.add('bf16/model.safetensors')
+        snap = hub.snapshot_download('org/tiny', cache_dir=self.cache,
+                                     progress=quiet, endpoint=self.fake.url,
+                                     subfolder='bf16')
+        self.assertTrue(snap.startswith(os.path.join(self.cache,
+                                                     'org--tiny@bf16')))
+        self.assertEqual(sorted(os.listdir(snap)),
+                         ['config.json', 'manifest.json',
+                          'model.safetensors', 'tokenizer.json'])
+        paths = [p for p, _ in self.fake.requests if '/resolve/' in p]
+        self.assertTrue(paths and all('/resolve/%s/bf16/' % COMMIT in p
+                                      for p in paths), paths)
+        self.assertEqual(hub.find_local('org/tiny', self.cache,
+                                        subfolder='bf16'), snap)
+        # The top-level model is a different cache entry.
+        self.assertIsNone(hub.find_local('org/tiny', self.cache))
+        hub.verify_snapshot(snap)
+        top = self.dl()
+        self.assertNotEqual(top, snap)
+        self.assertIn('generation_config.json', os.listdir(top))
+
+    def test_bad_subfolder(self):
+        for bad in ('..', 'a/../b', '.hidden', 'a b', 'x' * 100, 'a\\b'):
+            with self.assertRaises(hub.HubError):
+                hub.snapshot_download('org/tiny', cache_dir=self.cache,
+                                      progress=quiet,
+                                      endpoint=self.fake.url, subfolder=bad)
+        with self.assertRaises(hub.HubError):         # nothing in there
+            hub.snapshot_download('org/tiny', cache_dir=self.cache,
+                                  progress=quiet, endpoint=self.fake.url,
+                                  subfolder='onnx')
+
     def test_corrupt_download_rejected(self):
         self.fake.corrupt.add('model.safetensors')
         with self.assertRaises(hub.HubError):

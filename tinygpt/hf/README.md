@@ -298,10 +298,13 @@ Pythonista, because its interpreter stays alive between runs.
   `unsupported model` error. So do tokenizers that aren't byte-level BPE
   (SentencePiece, byte fallback) or need a normalizer other than NFC.
 - Aurora2-400M-A20M has no chat template (`chat` refuses it; use `complete`
-  or `ask`, which add its BOS token). The downloader fetches the root
-  `model.safetensors` (float32, 1.6 GB); the repository's smaller `bf16/`
-  and `fp16/` copies sit in subfolders, which the downloader's
-  plain-filename allowlist does not fetch.
+  or `ask`, which add its BOS token). By default the downloader fetches the
+  root float32 `model.safetensors` (1.6 GB). The repository also keeps
+  half-size copies in `bf16/` and `fp16/` directories; fetch one with
+  `--subfolder bf16` (or `SUBFOLDER = 'bf16'`), and pass the same option to
+  every later command, since each subfolder is cached as its own model
+  (`hf_models/<org>--<name>@bf16/`). Only a directory's direct files are
+  fetched, and the usual allowlist applies inside it.
 - LFM3-1.7B is 3.5 GB of BF16 weights (6.9 GB in float32), so on a phone
   it runs in lowmem mode only. Its cache costs about 148 KB per token (keys and
   values for 11 attention layers, conv input for 13), so a 1024-token
