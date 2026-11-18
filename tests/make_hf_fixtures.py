@@ -38,6 +38,12 @@ nor the *.npz/*.safetensors patterns this repo ignores or LFS-tracks:
   tiny_lfm3.json      a random tiny LFM3 with every LFM3 feature, with
                       logits from lfm3_reference_forward() below
   lfm3_tokens.json    LFM3-1.7B encodings (ignore_merges, digit groups)
+  tiny_aurora2.json   a random tiny Aurora2 with every Aurora2 feature, with
+                      logits from aurora2_reference_forward() below
+  aurora2_tokens.json Aurora2-400M-A20M encodings (BOS added by the
+                      post-processor, individual digits)
+  aurora2_logits.json Aurora2-400M-A20M float32 reference logits (from
+                      the transcription, run on the real checkpoint)
   chat_templates.json real chat templates from several model repos,
                       rendered by transformers' own renderer (fetches the
                       templates from the Hub; skipped when offline)
@@ -657,14 +663,239 @@ def lfm3_tokens(model_dir):
                               'ids': [ref.encode(t).ids for t in texts]})
 
 
+# --------------------------------------------------------------- aurora2
+
+AURORA2_CFG = dict(
+    model_type='aurora2', architectures=['Aurora2ForCausalLM'],
+    vocab_size=96, d_model=24, n_layers=3, n_heads=4, n_kv_heads=2,
+    head_dim=8, num_experts=5, ffn_dim=20, ffn_shared_dim=12,
+    ngram_buckets=64, ngram_dim=4, ngram_sizes=[2, 3, 4], ngram_seed=1337,
+    rope_theta=10000.0, rms_norm_eps=1e-6, max_position_embeddings=128,
+    gate_dim=6, logit_softcap=7.0, tie_word_embeddings=False,
+    bos_token_id=0, eos_token_id=1, pad_token_id=2)
+
+
+def aurora2_reference_forward(cfg, sd, ids, routes=None):
+    '''Logits (T, vocab) of an Aurora2 over the whole sequence: a literal,
+    unoptimised PyTorch transcription of modeling_aurora2.py (read as
+    text, never run), sharing no code with tinygpt/hf/aurora2.py.'''
+    import torch
+    import torch.nn.functional as F
+    c = cfg
+    ids = torch.tensor([ids], dtype=torch.long)
+    B, T = ids.shape
+    d, hq, hkv, hd = c['d_model'], c['n_heads'], c['n_kv_heads'], \
+        c['head_dim']
+    eps = c['rms_norm_eps']
+
+    def rms(x, w):
+        return F.rms_norm(x, (x.shape[-1],), w, eps)
+
+    def qk_norm(x, w):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * w
+
+    def rope(x, cos, sin):
+        h = x.shape[-1] // 2
+        x1, x2 = x[..., :h], x[..., h:]
+        cc, ss = cos[None, :, None, :], sin[None, :, None, :]
+        return torch.cat([x1 * cc - x2 * ss, x2 * cc + x1 * ss], -1)
+
+    def ngram_hash(ids, n, seed, nb):
+        h = torch.full_like(ids, seed + 7919 * n)
+        for k in range(n):
+            xk = F.pad(ids, (k, 0))[:, :ids.shape[1]]
+            h = (h * 1000003 + xk + 1) & 0x7FFFFFFF
+            h = h ^ (h >> 13)
+        h = (h * 40503) & 0x7FFFFFFF
+        return (h >> 4) % nb
+
+    feats = [F.embedding(ngram_hash(ids, n, c['ngram_seed'],
+                                    c['ngram_buckets']),
+                         sd['model.ng_emb'][i])
+             for i, n in enumerate(c['ngram_sizes'])]
+    x = F.embedding(ids, sd['model.tok_emb.weight']) \
+        + sd['model.ng_gate'] * F.linear(torch.cat(feats, -1),
+                                         sd['model.ng_proj'])
+    x0 = x
+    pos = torch.arange(T).float()
+    inv = 1.0 / (c['rope_theta'] ** (torch.arange(0, hd, 2).float() / hd))
+    fr = torch.outer(pos, inv)
+    cos, sin = fr.cos(), fr.sin()
+    v1 = None
+    for i in range(c['n_layers']):
+        P = 'model.blocks.%d.' % i
+        W = lambda n: sd[P + n]
+        x = W('lam')[0] * x + W('lam')[1] * x0
+        a = rms(x, W('ln1'))
+        q = F.linear(a, W('wq')).reshape(B, T, hq, hd)
+        k = F.linear(a, W('wk')).reshape(B, T, hkv, hd)
+        v = F.linear(a, W('wv')).reshape(B, T, hkv, hd)
+        v_raw = v
+        if i > 0:
+            v = W('vl')[0] * v + W('vl')[1] * v1
+        q = rope(qk_norm(q, W('q_norm')), cos, sin).transpose(1, 2)
+        k = rope(qk_norm(k, W('k_norm')), cos, sin).transpose(1, 2)
+        v = v.transpose(1, 2)
+        rep = hq // hkv
+        k = k.repeat_interleave(rep, dim=1)
+        v = v.repeat_interleave(rep, dim=1)
+        o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        gate = 2.0 * torch.sigmoid(F.linear(a[..., :c['gate_dim']],
+                                            W('ag_w')))
+        o = o.transpose(1, 2) * gate.unsqueeze(-1)
+        x = x + F.linear(o.reshape(B, T, hq * hd), W('wo'))
+        m = rms(x, W('ln2'))
+        sg, su = F.linear(m, W('s13')).chunk(2, -1)
+        sh = F.linear(F.silu(sg) * su, W('s2'))
+        mm = m.reshape(B * T, d)
+        probs = F.linear(mm, W('router_w'), W('router_b')).softmax(-1)
+        g, idx = probs.max(-1)
+        if routes is not None:
+            routes.append(idx.tolist())
+        out = torch.zeros_like(mm)
+        ffn = c['ffn_dim']
+        for e in idx.unique().tolist():
+            sel = (idx == e).nonzero(as_tuple=True)[0]
+            h = F.linear(mm[sel], W('w13')[e])
+            y = F.linear(F.silu(h[:, :ffn]) * h[:, ffn:], W('w2')[e])
+            out.index_copy_(0, sel, y)
+        ex = (out * g.unsqueeze(-1)).view(B, T, d)
+        x = x + sh + ex
+        if i == 0:
+            v1 = v_raw
+    x = rms(x, sd['model.final_norm'])
+    z = F.linear(x, sd['model.tok_emb.weight'])
+    cap = c['logit_softcap']
+    return (cap * torch.tanh(z / cap))[0]
+
+
+def aurora2_shapes(c):
+    d, hq, hkv, hd = c['d_model'], c['n_heads'], c['n_kv_heads'], \
+        c['head_dim']
+    E, f, sh = c['num_experts'], c['ffn_dim'], c['ffn_shared_dim']
+    n = len(c['ngram_sizes'])
+    shapes = {'model.tok_emb.weight': (c['vocab_size'], d),
+              'model.ng_emb': (n, c['ngram_buckets'], c['ngram_dim']),
+              'model.ng_proj': (d, n * c['ngram_dim']),
+              'model.ng_gate': (d,), 'model.final_norm': (d,)}
+    for i in range(c['n_layers']):
+        p = 'model.blocks.%d.' % i
+        shapes.update({
+            p + 'ln1': (d,), p + 'ln2': (d,), p + 'wq': (hq * hd, d),
+            p + 'wk': (hkv * hd, d), p + 'wv': (hkv * hd, d),
+            p + 'wo': (d, hq * hd), p + 'q_norm': (hq, hd),
+            p + 'k_norm': (hkv, hd), p + 'router_w': (E, d),
+            p + 'router_b': (E,), p + 's13': (2 * sh, d), p + 's2': (d, sh),
+            p + 'w13': (E, 2 * f, d), p + 'w2': (E, d, f), p + 'lam': (2,),
+            p + 'ag_w': (hq, c['gate_dim'])})
+        if i > 0:
+            shapes[p + 'vl'] = (2,)
+    return shapes
+
+
+def tiny_aurora2():
+    '''A tiny random Aurora2 (float32, as the real checkpoint) with every
+    feature on: learned lam and vl, nonzero gates, a softcap that bites,
+    several experts used, 30 tokens including repeats so n-gram hashes
+    collide with themselves.'''
+    import torch
+    from safetensors.torch import save
+    torch.manual_seed(31)
+    cfg = dict(AURORA2_CFG)
+    sd = {}
+    for k, shp in sorted(aurora2_shapes(cfg).items()):
+        v = torch.randn(shp) * 0.3
+        if k.endswith(('ln1', 'ln2', 'final_norm', 'q_norm', 'k_norm')):
+            v += 1.0
+        if k.endswith('.lam'):
+            v = torch.tensor([0.9, 0.4]) + 0.1 * torch.randn(2)
+        if k.endswith('.vl'):
+            v = torch.tensor([0.6, 0.4]) + 0.1 * torch.randn(2)
+        sd[k] = v
+    g = torch.Generator().manual_seed(32)
+    ids = torch.randint(3, 96, (30,), generator=g).tolist()
+    ids[10:14] = ids[2:6]
+    ids[0] = 0
+    routes = []
+    with torch.no_grad():
+        logits = aurora2_reference_forward(cfg, sd, ids, routes)
+    # Every layer must really route to several experts.
+    assert all(len(set(r)) >= 3 for r in routes), routes
+    logits = logits.numpy().astype(np.float32)
+    dump('tiny_aurora2.json', {
+        'config': cfg, 'safetensors': b64(save(
+            {k: v.contiguous() for k, v in sd.items()})),
+        'ids': ids, 'logits': b64(logits.tobytes()),
+        'logits_shape': list(logits.shape),
+        'reference': 'aurora2_reference_forward (tests/make_hf_fixtures.py)'})
+
+
+def aurora2_tokens(model_dir):
+    from tokenizers import Tokenizer
+    ref = Tokenizer.from_file(os.path.join(model_dir, 'tokenizer.json'))
+    texts = TEXTS + NFC_TEXTS + random_texts(500, seed=6) + [
+        'The Capital of France is', '1234567 89 3.14159 007',
+        '<|bos|>Hello<|eos|><|pad|>', ' leading space', 'tab\tnewline\n']
+    with open(os.path.join(HERE, 'make_hf_fixtures.py'), 'rb') as fh:
+        texts.append(fh.read().decode('utf-8'))
+    dump('aurora2_tokens.json', {
+        'texts': texts,
+        'ids': [ref.encode(t).ids for t in texts],
+        'ids_plain': [ref.encode(t, add_special_tokens=False).ids
+                      for t in texts],
+        'decoded': [ref.decode(ref.encode(t).ids, skip_special_tokens=False)
+                    for t in texts]})
+
+
+def aurora2_logits(model_dir):
+    '''Aurora2-400M-A20M float32 reference logits from
+    aurora2_reference_forward on the real checkpoint (not the repository's
+    own code, which is never run): every prompt position on a column
+    subset, the full last position, and a 24-token greedy continuation.'''
+    import torch
+    from safetensors.torch import load_file
+    from tokenizers import Tokenizer
+    with open(os.path.join(model_dir, 'config.json'), 'rb') as fh:
+        cfg = json.loads(fh.read().decode('utf-8'))
+    sd = load_file(os.path.join(model_dir, 'model.safetensors'))
+    tok = Tokenizer.from_file(os.path.join(model_dir, 'tokenizer.json'))
+    prompt = ('The Capital of France is Paris. 2 + 2 = 4. In 1969, the '
+              'first humans walked on the Moon, and')
+    ids = tok.encode(prompt).ids
+    cols = list(range(0, cfg['vocab_size'], 97)) + [0, 1, 2, 16383]
+    with torch.no_grad():
+        logits = aurora2_reference_forward(cfg, sd, ids).numpy()
+        seq = list(ids)
+        for _ in range(24):
+            z = aurora2_reference_forward(cfg, sd, seq)[-1]
+            seq.append(int(z.argmax()))
+    dump('aurora2_logits.json', {
+        'prompt': prompt, 'ids': ids, 'cols': cols,
+        'logits_cols': b64(np.ascontiguousarray(
+            logits[:, cols]).astype(np.float32).tobytes()),
+        'last_logits': b64(logits[-1].astype(np.float32).tobytes()),
+        'greedy': seq[len(ids):],
+        'greedy_text': tok.decode(seq[len(ids):], skip_special_tokens=False)})
+
+
 def main():
     os.makedirs(FIX, exist_ok=True)
     args = sys.argv[1:]
     lfm3_dir = None
+    aurora2_dir = None
     for a in list(args):
+        if a.startswith('--aurora2='):
+            aurora2_dir = a.split('=', 1)[1]
+            args.remove(a)
         if a.startswith('--lfm3='):
             lfm3_dir = a.split('=', 1)[1]
             args.remove(a)
+    if '--only-aurora2' in args:
+        tiny_aurora2()
+        if aurora2_dir:
+            aurora2_tokens(aurora2_dir)
+            aurora2_logits(aurora2_dir)
+        return
     if '--only-lfm3' in args:
         args.remove('--only-lfm3')
         tiny_lfm3_via_lfm2()
@@ -700,6 +931,7 @@ def main():
     chat_templates()
     tiny_lfm3_via_lfm2()
     tiny_lfm3()
+    tiny_aurora2()
     if len(args) > 0:
         smollm2_tokens(args[0])
         smollm2_logits(args[0])
@@ -710,6 +942,9 @@ def main():
         qwen_instruct_chat(args[2])
     if lfm3_dir:
         lfm3_tokens(lfm3_dir)
+    if aurora2_dir:
+        aurora2_tokens(aurora2_dir)
+        aurora2_logits(aurora2_dir)
 
 
 if __name__ == '__main__':
